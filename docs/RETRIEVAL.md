@@ -404,8 +404,7 @@ evaluator freezes your rank the moment the target appears.
 
 ```bash
 # the whole agent, the normal way
-python3 -m evaluator.local_evaluator --catalog data/catalog.jsonl \
-                                     --dataset data/public_set.jsonl
+python3 -m evaluator.local_evaluator
 
 # retrieval alone, with a scaffolding slot filler (isolates retrieval quality)
 python3 scripts/score_multi_retrieval.py
@@ -417,9 +416,22 @@ python3 scripts/score_integrated.py
 python3 -m unittest discover tests
 ```
 
+Every script defaults to `data/catalog.jsonl` and `data/public_set.jsonl`, so
+the paths only need passing when you are using a different catalog.
+
+`data/catalog.jsonl` is a 58 MB Release download and is deliberately not in git
+— grab it yourself before running any of the above.
+
 The slot filler inside `scripts/score_multi_retrieval.py` reads the simulator's
 sentence templates. It is scaffolding for measuring retrieval on its own, is
 labelled as such in the file, and is not part of the agent.
+
+To use the real sentence encoder you also need the venv, since the library is
+not installed globally:
+
+```bash
+.venv/bin/python scripts/score_multi_retrieval.py --vector sentence-transformers
+```
 
 ---
 
