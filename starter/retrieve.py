@@ -18,9 +18,49 @@ list costs nothing but a turn.
 from __future__ import annotations
 
 import math
+import os
 
 from starter.preprocessing import Preprocessing
 from starter.schema import Constraint, SessionState
+
+# ---------------------------------------------------------------------------
+# Candidate generation is delegated to the multi_retrieval package.
+#
+# Measured inside this pipeline, on the 200 public sessions, with everything
+# else (extract, state, rank, ask) unchanged:
+#
+#     _original_retrieve + rank.py       0.5560
+#     multi_retrieval    + rank.py       0.6995
+#
+# Ranking is deliberately NOT taken over: agent.py already calls rank.rank()
+# after this function, and letting it score the pool is worth another 0.03 over
+# multi_retrieval ordering the results itself. This function's job is to decide
+# WHICH candidates rank.py sees, nothing more.
+#
+# Flip this to False to restore the original implementation, which is preserved
+# below as _original_retrieve. Nothing else needs changing.
+# ---------------------------------------------------------------------------
+USE_MULTI_RETRIEVAL = True
+
+# multi_retrieval builds its own index and needs the catalog file, which
+# Preprocessing does not record. Override with TECHJAM_CATALOG if you run the
+# evaluator against a different one.
+_CATALOG_PATH = os.environ.get("TECHJAM_CATALOG", "data/catalog.jsonl")
+
+# How many candidates to hand rank.py. Matches the original _FUSE_LIMIT so the
+# downstream stages see a pool of the size they were tuned against.
+_POOL_SIZE = 200
+
+# Their Constraint.attribute vocabulary -> multi_retrieval slot names. The two
+# line up because both are typed by attribute; "use_case" has no direct slot so
+# it lands on the nearest one, and anything unmapped goes to free_text rather
+# than being dropped.
+_ATTRIBUTE_TO_SLOT = {
+    "material": "material", "color": "color", "size": "size",
+    "style": "style", "use_case": "occasion", "brand": "brand",
+}
+
+_RETRIEVER = None
 
 # Reciprocal-rank fusion constant. 60 is the usual default; it flattens the
 # difference between rank 1 and rank 2 so no single route can dominate.
@@ -174,8 +214,79 @@ def _fallback(prep: Preprocessing, state: SessionState) -> list[str]:
     return sorted(source, key=lambda a: -prep.popularity.get(a, 0.0))[:_FALLBACK_LIMIT]
 
 
+def _multi_retriever(prep: Preprocessing):
+    """Build the multi_retrieval index once and reuse it.
+
+    Indexing 50,000 products takes a little over a second, so this must not
+    happen per turn. The catalog is checked against the one Preprocessing
+    loaded: indexing a different file would produce candidates that rank.py
+    and ask.py cannot resolve, and it would fail silently rather than loudly.
+    """
+    global _RETRIEVER
+    if _RETRIEVER is None:
+        from multi_retrieval import DualTrackRetriever
+
+        retriever = DualTrackRetriever(_CATALOG_PATH)
+        if retriever.index.size != prep.n_docs:
+            raise RuntimeError(
+                f"catalog mismatch: multi_retrieval indexed {retriever.index.size} "
+                f"products from {_CATALOG_PATH!r}, but preprocessing loaded "
+                f"{prep.n_docs}. Set TECHJAM_CATALOG to the catalog actually in use."
+            )
+        _RETRIEVER = retriever
+    return _RETRIEVER
+
+
+def _slots_from(state: SessionState):
+    """Turn the accumulated SessionState into multi_retrieval's Slots.
+
+    `category_trusted` is left False on purpose. state.py *infers* the category
+    from the words the customer used, and filtering on an inferred category was
+    measured to cost 0.11 -- the target survived only 8% of turns while a route
+    had already found it 99.2% of the time. Only a category quoted word-for-word
+    is safe to filter on.
+    """
+    from multi_retrieval import Slots
+
+    slots = Slots(category=state.category or "")
+    for constraint in state.constraints:
+        name = _ATTRIBUTE_TO_SLOT.get(constraint.attribute)
+        if name and not getattr(slots, name):
+            setattr(slots, name, constraint.text)
+        elif constraint.text not in slots.free_text:
+            slots.free_text.append(constraint.text)
+    return slots
+
+
 def retrieve(prep: Preprocessing, state: SessionState) -> list[str]:
-    """Fuse the three routes by reciprocal rank and return the top candidates."""
+    """Find the candidate products.  <- the only public name
+
+    Same contract as before: returns roughly 200 parent_asins for rank.py to
+    score. See USE_MULTI_RETRIEVAL at the top of this file.
+    """
+    if not USE_MULTI_RETRIEVAL:
+        return _original_retrieve(prep, state)
+
+    from multi_retrieval import DualQuery
+
+    result = _multi_retriever(prep).retrieve(DualQuery(
+        slots=_slots_from(state),
+        intent=state.scenario,
+        top_k=_POOL_SIZE,
+    ))
+    pool = result.parent_asins
+    # An empty list is a guaranteed miss; the original never returned one and
+    # neither does this. multi_retrieval falls back internally, so this is a
+    # belt-and-braces guard rather than an expected path.
+    return pool or _fallback(prep, state)
+
+
+def _original_retrieve(prep: Preprocessing, state: SessionState) -> list[str]:
+    """Fuse the three routes by reciprocal rank and return the top candidates.
+
+    The original Owner C implementation, kept intact. Set
+    USE_MULTI_RETRIEVAL = False at the top of this file to make it live again.
+    """
     routes = {
         "keyword": _keyword(prep, state),
         "category": _category(prep, state),
