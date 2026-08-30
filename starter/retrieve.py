@@ -21,7 +21,7 @@ import math
 import os
 
 from starter.preprocessing import Preprocessing
-from starter.schema import Constraint, SessionState
+from starter.schema import SessionState, Slot
 
 # ---------------------------------------------------------------------------
 # Candidate generation is delegated to the multi_retrieval package.
