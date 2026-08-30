@@ -1,0 +1,12 @@
+# Dependencies for the starter/ normalisation pipeline.
+#
+#   python -m starter.pipeline run --no-llm     needs NOTHING here (stdlib only)
+#   python -m starter.pipeline run              needs anthropic
+#   to_dataframe()                              needs pandas
+#
+# Majors are capped deliberately: anthropic went 0.x -> 1.x with breaking
+# changes to the batches/types surface this pipeline calls, so an uncapped
+# install would silently break starter/llm_labels.py.
+
+anthropic>=1.2,<2      # Message Batches API -- style + use_case labelling
+pandas>=3.0,<4         # optional: starter.pipeline.to_dataframe()
