@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Annotated, Literal, Sequence
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from starter import preprocessing
 from starter.schema import HARD_CONFIDENCE, REACHABLE_ATTRIBUTES, SessionState
@@ -36,6 +36,7 @@ _TIMEOUT = 2.0
 _MAX_ATTEMPTS = 2               # per turn: first try, then one corrective retry
 _MAX_CONSECUTIVE_FAILURES = 2   # failed turns before the provider is abandoned
 _MAX_SLOTS = 8
+_BUDGET_TOLERANCE = 1.05
 
 # Confidence carried by each template frame, calibrated against
 # HARD_CONFIDENCE (0.75). See the frame table below for why each is what it is.
@@ -209,9 +210,9 @@ _OUTPUT_SHAPE = """{
     "attributes": [
         {
             "attribute": str = "<one of: category|material|color|brand|budget|style|feature|use_case|others>",
-            "value": str | list[str] | number = "<the requirement, in the words a product listing would use>",
+            "value": str | list[str] | number = "<the requirement, in the words a product listing would use; empty if this object only rules something OUT>",
             "confidence": float = <0.0-1.0>,
-            "negated": list[str] = <true if the customer is ruling this OUT>
+            "negated": list[str] = <values the customer is ruling OUT for this attribute; empty list if none>
         }
     ],
     "buy_intent": float = <0.0-1.0, see OVERALL BUY INTENT below>
@@ -219,19 +220,37 @@ _OUTPUT_SHAPE = """{
 
 
 class ExtractedAttribute(BaseModel):
-    """One attribute the model read out of the conversation."""
+    """One attribute the model read out of the conversation.
+
+    `value` and `negated` are independent: an entry may carry a wanted value,
+    a list of excluded values, or both ("cotton, not leather" for material).
+    At least one of the two must be non-empty -- _coerce_attribute drops
+    entries that carry neither before they ever reach this model.
+    """
 
     attribute: _LLMAttribute
-    value: Annotated[str, Field(min_length=1, max_length=180)]
+    value: Annotated[str, Field(default="", max_length=180)]
     confidence: Annotated[float, Field(ge=0.0, le=1.0)]
-    negated: bool = False
+    negated: Annotated[list[str], Field(default_factory=list, max_length=10)]
 
     @field_validator("value", mode="after")
     @classmethod
-    def _clean_value(cls, value: str) -> str:
+    def _clean_value(cls, value: str, info: ValidationInfo) -> str:
+        if not value:
+            return value
+        if info.data.get("attribute") == "budget":
+            try:
+                return str(float(value))
+            except ValueError as exc:
+                raise ValueError(f"budget value {value!r} is not a plain number") from exc
         # The same normalization the catalog index was built with. Without it a
         # model-supplied string can never match postings even when it is right.
         return preprocessing.clean_constraint(value)
+
+    @field_validator("negated", mode="after")
+    @classmethod
+    def _clean_negated(cls, values: list[str]) -> list[str]:
+        return [preprocessing.clean_constraint(v) for v in values if v]
 
 
 class LLMReading(BaseModel):
@@ -239,8 +258,6 @@ class LLMReading(BaseModel):
 
     attributes: Annotated[
         list[ExtractedAttribute], Field(default_factory=list, max_length=_MAX_SLOTS)]
-    declined: Annotated[list[_LLMAttribute], Field(default_factory=list, max_length=3)]
-    override: bool = False
     buy_intent: Annotated[float, Field(ge=0.0, le=1.0)] = 0.5
 
 
@@ -300,15 +317,24 @@ def _coerce_attribute(raw: object) -> dict | None:
     if isinstance(value, (list, tuple)):
         value = ", ".join(str(v) for v in value if v)
     value = str(value or "").strip()
-    if not value:
-        return None
+
+    negated_raw = item.get("negated")
+    if isinstance(negated_raw, str):
+        negated_raw = [negated_raw]
+    negated = [str(v).strip() for v in negated_raw if str(v).strip()] \
+        if isinstance(negated_raw, list) else []
+
+    if not value and not negated:
+        return None        # neither a preference nor an exclusion: nothing to keep
 
     confidence = _as_float(item.get("confidence"))
     if confidence is None:
-        return None        # confidence is the model's job; we do not invent one
+        if value:
+            return None     # confidence is the model's job; we do not invent one
+        confidence = 0.0    # a pure exclusion carries no "how much they want it" signal
 
     return {"attribute": name, "value": value[:180], "confidence": confidence,
-            "negated": bool(item.get("negated"))}
+            "negated": negated[:10]}
 
 
 def _coerce_reading(raw: object) -> dict:
@@ -316,7 +342,7 @@ def _coerce_reading(raw: object) -> dict:
     if isinstance(raw, list):                       # a bare list of attributes
         raw = {"attributes": raw}
     if not isinstance(raw, dict):
-        return {"attributes": [], "declined": [], "override": False, "buy_intent": 0.5}
+        return {"attributes": [], "buy_intent": 0.5}
 
     lowered = {str(k).strip().lower(): v for k, v in raw.items()}
     entries = lowered.get("attributes")
@@ -336,24 +362,12 @@ def _coerce_reading(raw: object) -> dict:
 
     attributes = [c for c in (_coerce_attribute(e) for e in entries) if c]
 
-    declined_raw = lowered.get("declined") or []
-    if isinstance(declined_raw, str):
-        declined_raw = [declined_raw]
-    declined = []
-    for name in declined_raw if isinstance(declined_raw, list) else []:
-        cleaned = str(name).strip().lower().replace("-", "_")
-        cleaned = _ATTRIBUTE_SYNONYMS.get(cleaned, cleaned)
-        if cleaned in _LLM_ATTRIBUTES and cleaned not in declined:
-            declined.append(cleaned)
-
     # Reuses _as_float so "0.8", "80%" etc. parse the same way confidence does.
     # A missing or unparseable score defaults to 0.5 -- neutral, not a guess.
     buy_intent = _as_float(lowered.get("buy_intent"))
 
     return {
         "attributes": attributes[:_MAX_SLOTS],
-        "declined": declined[:3],
-        "override": bool(lowered.get("override")),
         "buy_intent": buy_intent if buy_intent is not None else 0.5,
     }
 
@@ -581,11 +595,11 @@ def _llm_frame(message: str, turn: int, state: SessionState) -> _Frame | None:
         return None
     _failures = 0
 
-    # Group by attribute: the model reports a wanted value and a negated value
-    # as separate entries sharing the same attribute, and one _Reading per
-    # attribute carries both -- e.g. "not leather" becomes
-    # _Reading(attribute="material", negated=["leather"]). Confidence on the
-    # wanted side comes from the model verbatim; rescaling it here would
+    # Group by attribute: the model may split one attribute's wanted value and
+    # its exclusions across several entries ("cotton" and "not leather" as two
+    # objects), so entries sharing an attribute are merged into one _Reading --
+    # wanted values compete on confidence, negated lists union. Confidence on
+    # the wanted side comes from the model verbatim; rescaling it here would
     # silently overrule its judgement of how sure the customer is.
     by_attribute: dict[str, list] = {}
     for item in reading.attributes:
@@ -593,8 +607,12 @@ def _llm_frame(message: str, turn: int, state: SessionState) -> _Frame | None:
 
     readings = []
     for attribute, items in by_attribute.items():
-        wanted = [i for i in items if not i.negated]
-        negated = [i.value for i in items if i.negated]
+        wanted = [i for i in items if i.value]
+        negated: list[str] = []
+        for i in items:
+            for v in i.negated:
+                if v not in negated:
+                    negated.append(v)
         if wanted:
             best = max(wanted, key=lambda i: i.confidence)
             readings.append(_Reading(attribute=attribute, value=best.value,
@@ -624,9 +642,11 @@ def _apply(state: SessionState, frame: _Frame, turn: int) -> None:
         if value:
             key, resolution = _resolve(value)
             confidence = (reading.confidence * resolution) if key else _CONF_UNRESOLVED
+            # ExtractedAttribute's validator already guaranteed this parses.
+            bound_value = float(value) * _BUDGET_TOLERANCE if attribute == "budget" else value
             slot = state.slots.get(attribute)
-            replaced = slot is not None
-            state.bind(attribute, value, key, confidence, turn)
+            replaced = slot is not None and slot.filled and slot.val != bound_value
+            state.bind(attribute, bound_value, key, confidence, turn)
             if replaced:
                 _cascade(state, attribute, turn)
 
