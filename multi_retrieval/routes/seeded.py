@@ -29,7 +29,7 @@ from ..types import Slots
 # Cap on how many products one fact may resolve to. A fact matching more than
 # this is too common to narrow anything, and materialising the set is wasteful.
 MATCH_CAP = 20000
-ROUTE_LIMIT = 500
+ROUTE_LIMIT = 500 
 
 
 class SeededRoute:

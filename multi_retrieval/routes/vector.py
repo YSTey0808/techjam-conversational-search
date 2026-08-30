@@ -18,7 +18,7 @@ from ..embed import Embedder, VectorStore
 from ..index import CatalogIndex
 from ..types import DualQuery
 
-ROUTE_LIMIT = 500
+ROUTE_LIMIT = 500 
 
 
 class VectorRoute:

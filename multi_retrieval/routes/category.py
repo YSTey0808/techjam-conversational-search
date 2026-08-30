@@ -15,7 +15,7 @@ from __future__ import annotations
 from ..index import CatalogIndex, tokens
 from ..types import Slots
 
-ROUTE_LIMIT = 500
+ROUTE_LIMIT = 500 
 
 # Slots that describe what kind of thing the customer wants. Colour or material
 # would only add noise here — they say nothing about which category path a

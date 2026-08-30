@@ -14,6 +14,9 @@ Public surface used by the five modules:
     prep.coarse[asin]            -> str
     prep.product_keys[asin]      -> tuple[str, ...]    every indexed string
     prep.attribute_of(key)       -> str
+    prep.title[asin]             -> str
+    prep.text[asin]              -> str                searchable text, truncated
+    prep.average_rating[asin]    -> float | None       stars, not the count
 """
 
 from __future__ import annotations
@@ -37,6 +40,10 @@ _WS_RE = re.compile(r"\s+")
 # excluded because "leather" would prefix-match a large slice of the catalog.
 MIN_PREFIX_LEN = 12
 PREFIX_FANOUT_CAP = 64
+
+# Per-product searchable text kept for the reranker. Truncated because the full
+# corpus over 50k products is far more than any downstream consumer reads.
+TEXT_LIMIT = 800        
 
 
 def clean_constraint(value: str, limit: int = CONSTRAINT_LIMIT) -> str:
@@ -103,6 +110,17 @@ def safe_price(product: dict) -> float | None:
     text = value.strip().lower().removeprefix("from").strip().lstrip("$").replace(",", "")
     try:
         return float(text)
+    except ValueError:
+        return None
+
+
+def safe_rating(product: dict) -> float | None:
+    """Average star rating. NEVER raises; None when the row has no usable value."""
+    value = product.get("average_rating")
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return float(value)
     except ValueError:
         return None
 
@@ -174,7 +192,10 @@ class Preprocessing:
         self.asins: list[str] = []
         self.popularity: dict[str, float] = {}
         self.rating_number: dict[str, int] = {}
+        self.average_rating: dict[str, float | None] = {}
         self.price: dict[str, float | None] = {}
+        self.title: dict[str, str] = {}
+        self.text: dict[str, str] = {}
         self.coarse: dict[str, str] = {}
         self.product_keys: dict[str, tuple[str, ...]] = {}
         self.postings: dict[str, set[str]] = {}
@@ -288,7 +309,10 @@ def build(catalog_path: str | Path) -> Preprocessing:
             rating = rating if isinstance(rating, int) else 0
             prep.rating_number[asin] = rating
             prep.popularity[asin] = math.log1p(max(rating, 0))
+            prep.average_rating[asin] = safe_rating(product)
             prep.price[asin] = safe_price(product)
+            prep.title[asin] = clean_constraint(str(product.get("title") or ""), TEXT_LIMIT)
+            prep.text[asin] = searchable_text(product)[:TEXT_LIMIT]
 
             category = coarse_category([str(v) for v in (product.get("categories") or [])])
             prep.coarse[asin] = category

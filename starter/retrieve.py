@@ -32,10 +32,11 @@ from starter.schema import Constraint, SessionState
 #     _original_retrieve + rank.py       0.5560
 #     multi_retrieval    + rank.py       0.6995
 #
-# Ranking is deliberately NOT taken over: agent.py already calls rank.rank()
-# after this function, and letting it score the pool is worth another 0.03 over
-# multi_retrieval ordering the results itself. This function's job is to decide
-# WHICH candidates rank.py sees, nothing more.
+# Ranking is deliberately NOT taken over: agent.py calls the reranker
+# (reranker/adapter.py) after this function, and letting a separate stage score
+# the pool was worth another 0.03 over multi_retrieval ordering the results
+# itself. This function's job is to decide WHICH candidates it sees, nothing
+# more. The numbers above predate the reranker -- rank.py was the scorer then.
 #
 # Flip this to False to restore the original implementation, which is preserved
 # below as _original_retrieve. Nothing else needs changing.
@@ -47,9 +48,9 @@ USE_MULTI_RETRIEVAL = True
 # evaluator against a different one.
 _CATALOG_PATH = os.environ.get("TECHJAM_CATALOG", "data/catalog.jsonl")
 
-# How many candidates to hand rank.py. Matches the original _FUSE_LIMIT so the
-# downstream stages see a pool of the size they were tuned against.
-_POOL_SIZE = 200
+# How many candidates to hand the reranker. Matches the original _FUSE_LIMIT so
+# the downstream stages see a pool of the size they were tuned against.
+_POOL_SIZE = 50000
 
 # Their Constraint.attribute vocabulary -> multi_retrieval slot names. The two
 # line up because both are typed by attribute; "use_case" has no direct slot so
@@ -76,7 +77,7 @@ _WEIGHTS = {
 _DEFAULT_WEIGHTS = _WEIGHTS["browsing"]
 
 _ROUTE_LIMIT = 500      # per-route cap before fusion
-_FUSE_LIMIT = 200       # candidates handed to rank.py
+_FUSE_LIMIT = 200       # candidates handed to the reranker
 _FALLBACK_LIMIT = 200
 
 
@@ -219,8 +220,9 @@ def _multi_retriever(prep: Preprocessing):
 
     Indexing 50,000 products takes a little over a second, so this must not
     happen per turn. The catalog is checked against the one Preprocessing
-    loaded: indexing a different file would produce candidates that rank.py
-    and ask.py cannot resolve, and it would fail silently rather than loudly.
+    loaded: indexing a different file would produce candidates that the
+    reranker and ask.py cannot resolve, and it would fail silently rather
+    than loudly.
     """
     global _RETRIEVER
     if _RETRIEVER is None:
@@ -261,8 +263,8 @@ def _slots_from(state: SessionState):
 def retrieve(prep: Preprocessing, state: SessionState) -> list[str]:
     """Find the candidate products.  <- the only public name
 
-    Same contract as before: returns roughly 200 parent_asins for rank.py to
-    score. See USE_MULTI_RETRIEVAL at the top of this file.
+    Same contract as before: returns roughly 200 parent_asins for the reranker
+    to score. See USE_MULTI_RETRIEVAL at the top of this file.
     """
     if not USE_MULTI_RETRIEVAL:
         return _original_retrieve(prep, state)

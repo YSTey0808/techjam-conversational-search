@@ -6,7 +6,7 @@ Five modules do the work, one owner each, one public function each:
     state.update(state, extraction)         -> SessionState    Owner B
     retrieve.retrieve(prep, state)          -> list[asin]      Owner C
     ask.decide(prep, state, pool, turn)     -> TurnPolicy      Owner E
-    rank.rank(prep, state, pool, top_k)     -> list[asin]      Owner D
+    adapter.rerank(prep, state, pool, k)    -> list[asin]      Owner D
 
 There is deliberately no branching, no logic and no fallback in this file.
 Anything that needs a decision belongs to the module that owns it -- including
@@ -20,7 +20,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from starter import ask, extract, preprocessing, rank, retrieve
+from reranker import adapter
+from starter import ask, extract, preprocessing, retrieve
 from starter import state as state_mod
 from starter.schema import SessionState
 
@@ -45,7 +46,7 @@ class Agent:
         state = state_mod.update(state, ex)
         pool = retrieve.retrieve(self.prep, state)
         policy = ask.decide(self.prep, state, pool, turn)
-        items = rank.rank(self.prep, state, pool, policy.list_width)
+        items = adapter.rerank(self.prep, state, pool, policy.list_width)
         self._sessions[session_id] = state
         return {
             "message": policy.message,

@@ -19,7 +19,7 @@ from __future__ import annotations
 from ..index import CatalogIndex, tokens
 from ..types import Slots
 
-ROUTE_LIMIT = 500
+ROUTE_LIMIT = 500 
 MAX_TERMS = 40
 
 
