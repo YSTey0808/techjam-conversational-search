@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 
 from starter.preprocessing import Preprocessing
-from starter.schema import Constraint, SessionState
+from starter.schema import SessionState, Slot
 
 # Reciprocal-rank fusion constant. 60 is the usual default; it flattens the
 # difference between rank 1 and rank 2 so no single route can dominate.

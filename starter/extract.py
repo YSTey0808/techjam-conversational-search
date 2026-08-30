@@ -1,30 +1,11 @@
-"""OWNER A -- turn a free-form sentence into an Extraction.
+"""OWNER A -- read one customer message into the session state.
 
-    extract(message, turn, state) -> Extraction        <- the only public name
+    extract(message, turn, state) -> SessionState      <- the only public name
 
-Customers write like people: "something waterproof for hiking, nothing over
-fifty bucks". They do not use templates, and they do not use catalog wording.
-
-THE VOCABULARY BRIDGE is the hard part of this module. "waterproof" has to
-reach products whose features say "Water Resistant". So the model is asked for
-`variants` -- likely catalog phrasings -- and each is resolved against the
-real index. The first variant with a non-empty posting list becomes
-Constraint.key, which is what retrieval actually looks up. An unresolved
-constraint keeps key="" and is still carried: it may match semantically later.
-
-ROBUSTNESS. A slow turn can cost the session, so the LLM is on a short leash:
-hard timeout, one retry, then a degraded rule-based path. extract() NEVER
-raises and never returns an empty-handed Extraction for a non-empty message.
-
-The degraded path is not a token dump -- it is a real rule-based extractor,
-because it is also what runs in CI (NullClient) and on any provider outage.
-
-CONFIG (environment only, no secrets in the repo):
-    TECHJAM_LLM_PROVIDER   null | ollama | openai      default: null
-    TECHJAM_LLM_MODEL      model name
-    TECHJAM_LLM_BASE_URL   e.g. http://localhost:11434  or an OpenAI-compatible base
-    TECHJAM_LLM_API_KEY    openai-compatible only
-    TECHJAM_LLM_TIMEOUT    seconds, default 2.0
+This module owns BOTH halves of understanding a turn: reading the message and
+writing what it learned into `SessionState`. There is no intermediate
+"Extraction" type -- state is the only memory, so a reading that never reaches
+a slot never happened.
 """
 
 from __future__ import annotations
@@ -32,408 +13,649 @@ from __future__ import annotations
 import json
 import os
 import re
-import urllib.error
-import urllib.request
+from dataclasses import dataclass, field
 from functools import lru_cache
+from typing import Annotated, Literal, Sequence
+
+from pydantic import BaseModel, Field, field_validator
 
 from starter import preprocessing
-from starter.schema import REACHABLE_ATTRIBUTES, Constraint, Extraction, SessionState
+from starter.schema import HARD_CONFIDENCE, REACHABLE_ATTRIBUTES, SessionState
 
-_TIMEOUT = float(os.environ.get("TECHJAM_LLM_TIMEOUT", "2.0"))
-_RETRIES = 1
-_SOFT_WEIGHT = 0.35          # weight for salvaged tokens in the degraded path
-_MAX_CONSTRAINTS = 8
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# --------------------------------------------------------------------------
+# config
+# --------------------------------------------------------------------------
+
+_TIMEOUT = 2.0
+_MAX_ATTEMPTS = 2               # per turn: first try, then one corrective retry
+_MAX_CONSECUTIVE_FAILURES = 2   # failed turns before the provider is abandoned
+_MAX_SLOTS = 8
+
+# Confidence carried by each template frame, calibrated against
+# HARD_CONFIDENCE (0.75). See the frame table below for why each is what it is.
+_CONF_HARD = 1.00        # a stated hard requirement
+_CONF_REVEAL = 0.90      # answers to our questions
+_CONF_SOFT = 0.55        # a preference that is about to be retracted
+_CONF_SALVAGE = 0.40     # a payload we could not validate
+_CONF_UNRESOLVED = 0.30  # nothing in the catalog matched; keep it visible anyway
 
 
 # --------------------------------------------------------------------------
-# providers
+# frames -- the deterministic router
 # --------------------------------------------------------------------------
 
-class _NullClient:
-    """Always fails. Makes the degraded path the tested path offline."""
+@dataclass
+class _Reading:
+    """Everything the customer told us about one attribute, this turn.
 
-    name = "null"
+    `value`/`confidence` are what they want -- `value` is empty when the
+    attribute was mentioned only to rule something out, never as a preference.
+    `negated` holds values ruled OUT for this same attribute ("nothing formal"
+    for style). Kept separate from `value`: wanting X and not-wanting Y are
+    different facts, and folding a negation into `value` would record it as a
+    preference for the very thing being rejected.
+    """
 
-    def complete(self, prompt: str) -> tuple[str, dict]:
-        raise RuntimeError("no LLM provider configured")
+    attribute: str
+    value: str = ""
+    confidence: float = 0.0
+    negated: list[str] = field(default_factory=list)
 
 
-class _OllamaClient:
-    name = "ollama"
+@dataclass
+class _Frame:
+    """One parsed message -- every _Reading it produced."""
 
-    def __init__(self, model: str, base_url: str) -> None:
-        self._model = model
-        self._url = base_url.rstrip("/") + "/api/generate"
+    name: str
+    readings: tuple[_Reading, ...] = ()
+    buy_intent: float = 0.5
 
-    def complete(self, prompt: str) -> tuple[str, dict]:
-        body = json.dumps({
-            "model": self._model, "prompt": prompt,
-            "stream": False, "format": "json",
-        }).encode()
-        request = urllib.request.Request(
-            self._url, data=body, headers={"Content-Type": "application/json"}
-        )
-        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
-            payload = json.loads(response.read().decode())
-        usage = {
-            "prompt_tokens": int(payload.get("prompt_eval_count") or 0),
-            "completion_tokens": int(payload.get("eval_count") or 0),
+
+# --------------------------------------------------------------------------
+# vocabulary -- payload to catalog key
+# --------------------------------------------------------------------------
+
+def _resolve(text: str, variants: Sequence[str] = ()) -> tuple[str, float]:
+    """Find the catalog key for a payload. Returns ("", 0.0) on a total miss.
+
+    Hop 1 is the whole game: the simulator only ever draws from a product's
+    first four indexed strings, which is exactly what canon_postings holds.
+    canon is checked before postings so shared boilerplate ("Imported",
+    "Machine Wash") cannot win a match that a characteristic string should.
+    """
+    prep = preprocessing.active()
+    if prep is None:
+        return "", 0.0
+
+    key = preprocessing.normalize(text)
+    if key:
+        if key in prep.canon_postings:
+            return key, 1.00
+        if key in prep.postings:
+            return key, 0.95
+    for variant in variants:
+        candidate = preprocessing.normalize(variant)
+        if candidate and (candidate in prep.canon_postings or candidate in prep.postings):
+            return candidate, 0.80
+    # Prefix-tolerant last resort. Return the normalized key, not an expanded
+    # one -- prep.lookup is prefix-tolerant on the read side too, so retrieval
+    # re-resolves identically.
+    if key and prep.lookup(key, broad=True):
+        return key, 0.60
+    return "", 0.0
+
+
+# --------------------------------------------------------------------------
+# dependency graph
+# --------------------------------------------------------------------------
+
+_DEPENDENTS: dict[str, tuple[str, ...]] = {
+    # sizing systems, style vocabulary and use cases are all category-scoped
+    "category": ("material", "style", "use_case", "feature", "others"),
+    # a feature is justified BY the use case: no hiking, no reason for waterproof
+    # "use_case": ("feature")
+}
+
+
+@lru_cache(maxsize=None)
+def _dependents(attribute: str) -> tuple[str, ...]:
+    """Transitive closure of the graph. Cycle-safe and order-stable.
+
+    Transitive rather than one level so category -> use_case -> feature still
+    reaches feature if someone later removes the direct edge.
+    """
+    seen: list[str] = []
+    queue = list(_DEPENDENTS.get(attribute, ()))
+    while queue:
+        current = queue.pop(0)
+        if current in seen or current == attribute:
+            continue
+        seen.append(current)
+        queue.extend(_DEPENDENTS.get(current, ()))
+    return tuple(seen)
+
+
+def _cascade(state: SessionState, parent: str, turn: int) -> None:
+    """Forget everything that depended on `parent`. Never touches this turn's work."""
+    for attribute in _dependents(parent):
+        slot = state.slots.get(attribute)
+        if slot is not None and slot.filled and slot.turn < turn:
+            state.forget(attribute)
+
+
+# --------------------------------------------------------------------------
+# buy intent
+# --------------------------------------------------------------------------
+
+# 0.0 = browsing = widen, unlock cross-category. 1.0 = buying = tighten onto
+# hard constraints. These are RETRIEVAL MODES, not the English words: a
+# customer can be certain they are only browsing.
+_BASE = 0.20
+_W_HARD = 0.22        # each firm requirement is strong evidence to tighten
+_W_CONF = 0.15        # how sure we are of what we hold
+_W_DRY = 0.08         # they have nothing left to add, so commit to what we have
+_W_TURN = 0.10        # turns are finite; drift toward committing
+_W_STUCK = 0.10       # we keep asking nothing: widen rather than spin
+
+
+def _buy_intent(state: SessionState, frame: _Frame | None, turn: int) -> float:
+    """Score the retrieval mode from evidence that actually occurs.
+
+    Category is excluded from the hard count because it is present in every
+    session from turn 1 and so carries no discriminating signal.
+    """
+    hard = [n for n in state.hard_slots if n != "category"]
+    scored = [s.confidence_score or 0.0
+              for n, s in state.filled_slots.items() if n != "category"]
+    mean_confidence = sum(scored) / len(scored) if scored else 0.0
+
+    raw = (_BASE
+           + _W_HARD * min(len(hard), 3)
+           + _W_CONF * mean_confidence
+           + _W_DRY * min(state.deflections, 2)
+           + _W_TURN * (min(turn, 10) / 10.0)
+           - _W_STUCK * min(state.nudges, 2))
+    value = max(0.0, min(1.0, raw))
+
+    # A retraction widens for exactly this turn while the demotions settle.
+    # Not persisted: next turn recomputes from evidence and springs back.
+    if frame is not None:
+        value = min(value, 0.35)
+    return value
+
+
+# --------------------------------------------------------------------------
+# the LLM contract -- schema, coercion, validation
+# --------------------------------------------------------------------------
+
+_LLM_ATTRIBUTES = (
+    "category", "material", "color", "brand",
+    "budget", "style", "feature", "use_case", "others",
+)
+_LLMAttribute = Literal[
+    "category", "material", "color", "brand",
+    "budget", "style", "feature", "use_case", "others",
+]
+
+# What the model is told to emit, and what it is checked against. Kept as one
+# literal so the prompt and the validator can never drift apart.
+_OUTPUT_SHAPE = """{
+    "attributes": [
+        {
+            "attribute": str = "<one of: category|material|color|brand|budget|style|feature|use_case|others>",
+            "value": str | list[str] | number = "<the requirement, in the words a product listing would use>",
+            "confidence": float = <0.0-1.0>,
+            "negated": list[str] = <true if the customer is ruling this OUT>
         }
-        return payload.get("response", ""), usage
+    ],
+    "buy_intent": float = <0.0-1.0, see OVERALL BUY INTENT below>
+}"""
 
 
-class _OpenAICompatClient:
-    name = "openai"
+class ExtractedAttribute(BaseModel):
+    """One attribute the model read out of the conversation."""
 
-    def __init__(self, model: str, base_url: str, api_key: str) -> None:
-        self._model = model
-        self._url = base_url.rstrip("/") + "/chat/completions"
-        self._key = api_key
+    attribute: _LLMAttribute
+    value: Annotated[str, Field(min_length=1, max_length=180)]
+    confidence: Annotated[float, Field(ge=0.0, le=1.0)]
+    negated: bool = False
 
-    def complete(self, prompt: str) -> tuple[str, dict]:
-        body = json.dumps({
-            "model": self._model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-        }).encode()
-        headers = {"Content-Type": "application/json"}
-        if self._key:
-            headers["Authorization"] = f"Bearer {self._key}"
-        request = urllib.request.Request(self._url, data=body, headers=headers)
-        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
-            payload = json.loads(response.read().decode())
-        raw = payload["choices"][0]["message"]["content"]
-        reported = payload.get("usage") or {}
-        usage = {
-            "prompt_tokens": int(reported.get("prompt_tokens") or 0),
-            "completion_tokens": int(reported.get("completion_tokens") or 0),
-        }
-        return raw, usage
+    @field_validator("value", mode="after")
+    @classmethod
+    def _clean_value(cls, value: str) -> str:
+        # The same normalization the catalog index was built with. Without it a
+        # model-supplied string can never match postings even when it is right.
+        return preprocessing.clean_constraint(value)
 
 
-def _client():
-    provider = os.environ.get("TECHJAM_LLM_PROVIDER", "null").strip().lower()
-    model = os.environ.get("TECHJAM_LLM_MODEL", "")
-    base = os.environ.get("TECHJAM_LLM_BASE_URL", "")
-    if provider == "ollama":
-        return _OllamaClient(model or "llama3.1", base or "http://localhost:11434")
-    if provider in ("openai", "openai_compat"):
-        return _OpenAICompatClient(
-            model or "gpt-4o-mini", base or "https://api.openai.com/v1",
-            os.environ.get("TECHJAM_LLM_API_KEY", ""),
-        )
-    return _NullClient()
+class LLMReading(BaseModel):
+    """The whole of what the model may tell us about one turn."""
+
+    attributes: Annotated[
+        list[ExtractedAttribute], Field(default_factory=list, max_length=_MAX_SLOTS)]
+    declined: Annotated[list[_LLMAttribute], Field(default_factory=list, max_length=3)]
+    override: bool = False
+    buy_intent: Annotated[float, Field(ge=0.0, le=1.0)] = 0.5
 
 
-# --------------------------------------------------------------------------
-# prompt + strict validation
-# --------------------------------------------------------------------------
+# --- deterministic coercion ------------------------------------------------
+# A model can be right about the content and still wrong about the shape:
+# "attribute" spelled "attr", one object instead of a list, confidence as the
+# string "0.8" or as a 0-100 percentage. Rejecting those loses a correct
+# reading over punctuation. So the raw payload is pushed through fixed,
+# deterministic rules FIRST, and only then validated -- coercion never guesses
+# at meaning, it only reshapes. Anything it cannot place is dropped.
 
-_PROMPT = """You extract shopping requirements from one customer message.
-
-Return ONLY a JSON object, no prose, with exactly these fields:
-{{
-  "constraints": [
-    {{"text": "<what they want, short>",
-      "attribute": "material|color|size|style|use_case|budget|feature",
-      "hard": true|false,
-      "variants": ["<phrasings a product listing might use>", "..."]}}
-  ],
-  "intent": "buying" | "browsing",
-  "override": true|false,
-  "no_preference": "<attribute they explicitly do not care about>" or null
-}}
-
-Rules:
-- "variants" matter most. Give 2-5 literal phrasings a clothing product page
-  would use. For "waterproof" give ["water resistant","waterproof","weatherproof"].
-- "hard" is true only for firm requirements (a budget cap, a stated must-have).
-- "override" is true if they retract or replace something said earlier.
-- Prefer few precise constraints over many vague ones.
-
-Turn: {turn}
-Already known: {known}
-Customer says: {message}
-"""
+_ATTRIBUTE_ALIASES = {
+    "attr": "attribute", "name": "attribute", "slot": "attribute", "field": "attribute",
+    "val": "value", "text": "value", "content": "value",
+    "score": "confidence", "confidence_score": "confidence", "certainty": "confidence",
+    "negative": "negated", "negation": "negated", "excluded": "negated",
+}
+_ATTRIBUTE_SYNONYMS = {
+    "colour": "color", "fabric": "material", "materials": "material",
+    "fit": "others", "sizing": "others", "price": "budget", "cost": "budget",
+    "usecase": "use_case", "use case": "use_case", "purpose": "use_case",
+    "features": "feature", "other": "others", "misc": "others",
+}
 
 
-def _prompt_for(message: str, turn: int, known: str) -> str:
-    return _PROMPT.format(turn=turn, known=known or "nothing yet", message=message)
+def _as_float(value: object) -> float | None:
+    """A confidence the model may have written as a string or a percentage."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        match = re.search(r"\d+(?:\.\d+)?", value)
+        if not match:
+            return None
+        number = float(match.group())
+    else:
+        return None
+    if number > 1.0:                      # "85" meaning 85%
+        number = number / 100.0
+    return max(0.0, min(1.0, number))
 
 
-def _coerce_attribute(value: object) -> str:
-    text = str(value or "").strip().lower()
-    return text if text in REACHABLE_ATTRIBUTES else "feature"
+def _coerce_attribute(raw: object) -> dict | None:
+    """One entry -> our field names, or None if it carries no usable value."""
+    if not isinstance(raw, dict):
+        return None
+    item = {_ATTRIBUTE_ALIASES.get(str(k).strip().lower(), str(k).strip().lower()): v
+            for k, v in raw.items()}
+
+    name = str(item.get("attribute") or "").strip().lower().replace("-", "_")
+    name = _ATTRIBUTE_SYNONYMS.get(name, name)
+    if name not in _LLM_ATTRIBUTES:
+        return None
+
+    value = item.get("value")
+    if isinstance(value, (list, tuple)):
+        value = ", ".join(str(v) for v in value if v)
+    value = str(value or "").strip()
+    if not value:
+        return None
+
+    confidence = _as_float(item.get("confidence"))
+    if confidence is None:
+        return None        # confidence is the model's job; we do not invent one
+
+    return {"attribute": name, "value": value[:180], "confidence": confidence,
+            "negated": bool(item.get("negated"))}
 
 
-def _validate(raw: str) -> dict | None:
-    """Strict schema validation. Returns None on anything unexpected."""
+def _coerce_reading(raw: object) -> dict:
+    """Whole payload -> the LLMReading shape. Never raises."""
+    if isinstance(raw, list):                       # a bare list of attributes
+        raw = {"attributes": raw}
+    if not isinstance(raw, dict):
+        return {"attributes": [], "declined": [], "override": False, "buy_intent": 0.5}
+
+    lowered = {str(k).strip().lower(): v for k, v in raw.items()}
+    entries = lowered.get("attributes")
+    if entries is None:
+        entries = lowered.get("slots") or lowered.get("constraints") or []
+    if isinstance(entries, dict):
+        # {"color": {"value": "black", "confidence": 0.9}} or {"color": "black"}
+        flattened = []
+        for name, body in entries.items():
+            if isinstance(body, dict):
+                flattened.append({"attribute": name, **body})
+            else:
+                flattened.append({"attribute": name, "value": body, "confidence": None})
+        entries = flattened
+    if not isinstance(entries, list):
+        entries = []
+
+    attributes = [c for c in (_coerce_attribute(e) for e in entries) if c]
+
+    declined_raw = lowered.get("declined") or []
+    if isinstance(declined_raw, str):
+        declined_raw = [declined_raw]
+    declined = []
+    for name in declined_raw if isinstance(declined_raw, list) else []:
+        cleaned = str(name).strip().lower().replace("-", "_")
+        cleaned = _ATTRIBUTE_SYNONYMS.get(cleaned, cleaned)
+        if cleaned in _LLM_ATTRIBUTES and cleaned not in declined:
+            declined.append(cleaned)
+
+    # Reuses _as_float so "0.8", "80%" etc. parse the same way confidence does.
+    # A missing or unparseable score defaults to 0.5 -- neutral, not a guess.
+    buy_intent = _as_float(lowered.get("buy_intent"))
+
+    return {
+        "attributes": attributes[:_MAX_SLOTS],
+        "declined": declined[:3],
+        "override": bool(lowered.get("override")),
+        "buy_intent": buy_intent if buy_intent is not None else 0.5,
+    }
+
+
+def _parse_reading(raw: str) -> LLMReading | None:
+    """Text -> validated LLMReading. None when nothing usable survives.
+
+    Two stages on purpose: slice out the JSON and reshape it deterministically,
+    then let pydantic be the single authority on whether the result is valid.
+    """
     if not isinstance(raw, str) or not raw.strip():
         return None
     text = raw.strip()
-    if not text.startswith("{"):                      # tolerate fenced output
-        start, end = text.find("{"), text.rfind("}")
+    if not text.startswith(("{", "[")):                 # tolerate fenced output
+        start = min((i for i in (text.find("{"), text.find("[")) if i != -1), default=-1)
+        end = max(text.rfind("}"), text.rfind("]"))
         if start == -1 or end <= start:
             return None
         text = text[start:end + 1]
     try:
-        data = json.loads(text)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("constraints"), list):
+        return LLMReading.model_validate(_coerce_reading(json.loads(text)))
+    except Exception:
         return None
 
-    constraints = []
-    for item in data["constraints"][:_MAX_CONSTRAINTS]:
-        if not isinstance(item, dict):
-            continue
-        body = str(item.get("text") or "").strip()
-        if not body:
-            continue
-        variants = item.get("variants")
-        variants = [str(v).strip() for v in variants if str(v).strip()] if isinstance(variants, list) else []
-        constraints.append({
-            "text": body,
-            "attribute": _coerce_attribute(item.get("attribute")),
-            "hard": bool(item.get("hard")),
-            "variants": variants[:6],
-        })
-    if not constraints:
-        return None
 
-    no_preference = data.get("no_preference")
-    no_preference = str(no_preference).strip().lower() if isinstance(no_preference, str) else None
-    if no_preference not in REACHABLE_ATTRIBUTES:
-        no_preference = None
-    return {
-        "constraints": constraints,
-        "intent": "buying" if str(data.get("intent", "")).lower() == "buying" else "browsing",
-        "override": bool(data.get("override")),
-        "no_preference": no_preference,
-    }
+# --------------------------------------------------------------------------
+# the prompt
+# --------------------------------------------------------------------------
+
+_ALLOWED_LABELS = "category|material|color|brand|budget|style|feature|use_case|other"
+_ALLOWED_VALUES = ""
+
+_SYSTEM = f"""You extract shopping constraints from a customer's latest message in an \
+ongoing product-search conversation. You output structured data ONLY.
+
+WHAT TO EXTRACT
+- One object per distinct requirement expressed or clearly implied in the LATEST message.
+- Use the conversation history ONLY to (a) resolve references like "the cheaper one" or \
+"that brand", and (b) detect when the customer is now RULING OUT something. Do not re-extract \
+constraints from earlier turns that the latest message doesn't touch.
+
+ATTRIBUTES (use these labels and values exactly; no others)
+Labels: {_ALLOWED_LABELS}; Values: {_ALLOWED_VALUES}
+- category : the product type ("jewelry", "clothing")
+- material : what it's made of ("leather", "cotton")
+- color    : ("red", "navy")
+- brand    : ("Nike")
+- budget   : the price limit the customer names, as a FLOAT (e.g. "around $100" -> 100.0).
+           Report the number EXACTLY as the customer said it. Do not add any margin
+           or rounding — the system applies the tolerance itself.
+- style    : aesthetic descriptors ("vintage", "minimalist") -- may be several
+- feature  : functional properties ("waterproof", "hypoallergenic") -- may be several
+- use_case : occasion or purpose ("for a wedding", "gift for dad") -- may be several
+- other    : a real constraint that fits none of the above
+- Everything is a STRING except budget, which is the object above.
+
+NEGATION
+- If the customer excludes something ("no leather", "not for kids", "anything but black"), \
+emit the object with "negated": ["leather"]. Otherwise "negated": [], empty list.
+
+CONFIDENCE SCORE for each attribute  (this is how much they WANT an item with this specific attribute)
+Judge how strongly the customer desires this attribute, from their wording and emphasis:
+- 0.9-1.0  Non-negotiable. "must", "need", "has to be", "only", "absolutely", "required".
+           Also: an explicit exclusion ("no leather") is a strong signal -> high.
+- 0.7-0.8 A plain, firm requirement stated without hedging ("blue earrings", "size 9").
+           A clearly named constraint with no enthusiasm marker still belongs HERE, not lower.
+- 0.4-0.5 A preference or lean. "prefer", "ideally", "would like", "leaning toward".
+- 0.1-0.3 A weak nice-to-have or hedge. "maybe", "kind of", "or something", "I guess".
+Do not default everything to one middle value. If the customer gives no intensity cue at all
+but clearly names the attribute, use 0.7. Reserve <0.4 for genuine hedging words.
+
+OVERALL BUY INTENT (one number for the whole turn)
+Buying means lock hard constraints, Browsing means unlock cross-category recommendation.
+Score 0.0-1.0 how ready the customer is to have results narrowed to exact matches on what
+they've stated, versus kept broad so they can keep exploring:
+- 1.0  They have given firm, specific requirements and want precise matches now.
+- 0.5  Mixed, early, or unclear.
+- 0.0  Still exploring; results should stay broad, other categories are fine too.
+Judge it from the WHOLE conversation so far, not just the latest message, and always set
+it, even on a turn that adds no new attributes.
+
+HARD RULES
+- If the latest message states NO product constraint (greeting, thanks, "show me more", \
+a question to you), still set "buy_intent" and return "attributes": [].
+- Never invent a constraint that isn't grounded in the message text. Every object must have \
+a source_span copied verbatim from the message.
+- Output ONLY a JSON object matching this shape, no prose, no markdown fences:
+{_OUTPUT_SHAPE}
+"""
+
+USER_TEMPLATE = """Conversation so far:
+{history}
+
+Latest customer message:
+"{message}"
+
+Extract the constraints from the latest message as a JSON array."""
 
 
-@lru_cache(maxsize=512)
-def _cached_call(message: str, turn: int, known: str) -> str | None:
-    """LLM call behind an LRU. Returns validated JSON text, or None.
+def _history(state: SessionState, limit: int = 6) -> str:
+    """The conversation so far, oldest first, as plain dialogue.
 
-    Cached on (message, turn) plus a digest of what we already know, because
-    the digest changes the prompt -- caching on the message alone would serve
-    a stale reading back into a different conversation.
+    A single line is often meaningless alone -- "I don't have a preference for
+    that" only means something next to the question it answers -- so the model
+    is given the exchange, not the utterance.
     """
-    client = _client()
-    prompt = _prompt_for(message, turn, known)
-    for _ in range(_RETRIES + 1):
-        try:
-            raw, usage = client.complete(prompt)
-        except (urllib.error.URLError, OSError, RuntimeError, ValueError, KeyError, TimeoutError):
-            continue
-        data = _validate(raw)
-        if data is not None:
-            data["usage"] = usage
-            return json.dumps(data)
-    return None
+    lines: list[str] = []
+    # history[-1] is the turn being read right now; the prompt quotes it
+    # separately, so showing it here too would just duplicate it.
+    for entry in state.history[:-1][-limit:]:
+        if entry.customer:
+            lines.append(f"Customer: {entry.customer}")
+        if entry.agent:
+            asked = f" [asked about: {entry.ask_attribute}]" if entry.ask_attribute else ""
+            lines.append(f"Agent{asked}: {entry.agent}")
+    return "\n".join(lines)
+
+def _user_prompt(message: str, turn: int, state: SessionState) -> str:
+    return (f"Conversation so far:\n{_history(state) or '(this is the first turn)'}\n\n"
+            f"Turn {turn}. The customer just said:\n{message}")
 
 
-# --------------------------------------------------------------------------
-# degraded rule-based path (also the offline/CI path)
-# --------------------------------------------------------------------------
+def _correction_prompt(original: str, bad_output: str) -> str:
+    """Retry prompt after a reply we could not parse.
 
-_STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "could", "do",
-    "does", "for", "from", "get", "give", "has", "have", "i", "im", "in", "is",
-    "it", "its", "just", "like", "looking", "me", "my", "need", "of", "on", "one",
-    "ones", "or", "please", "really", "show", "so", "some", "something", "that",
-    "the", "them", "then", "there", "these", "they", "this", "to", "too", "up",
-    "want", "was", "we", "what", "with", "would", "you", "your", "want", "wanna",
-    "find", "got", "am", "about", "any", "all", "much", "more", "not", "no",
-}
-_OVERRIDE_CUES = (
-    "actually", "forget", "instead", "never mind", "nevermind", "scratch that",
-    "no longer", "changed my mind", "on second thought", "rather than", "not the",
-    "drop the", "skip the",
-)
-_NO_PREF_CUES = (
-    "no preference", "doesn't matter", "does not matter", "dont care", "don't care",
-    "whatever", "up to you", "your judgment", "your judgement", "either is fine",
-    "any is fine", "no strong",
-)
-_NUMBER_WORDS = {
-    "ten": 10, "fifteen": 15, "twenty": 20, "twenty-five": 25, "thirty": 30,
-    "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "seventy-five": 75,
-    "eighty": 80, "ninety": 90, "hundred": 100, "two hundred": 200,
-}
-_BUDGET_CUES = ("under", "below", "less than", "no more than", "cheaper than",
-                "max", "budget", "up to", "nothing over", "not over", "within")
-_MATERIALS = ("cotton", "polyester", "nylon", "leather", "wool", "spandex", "silk",
-              "rayon", "denim", "suede", "fleece", "cashmere", "linen", "mesh")
-_COLORS = ("black", "white", "blue", "red", "pink", "green", "brown", "gray",
-           "grey", "purple", "yellow", "orange", "navy", "beige", "tan")
-_USE_CASES = ("hiking", "running", "gym", "workout", "winter", "summer", "rain",
-              "outdoor", "work", "office", "travel", "wedding", "party", "beach",
-              "waterproof", "warm", "breathable", "casual", "formal", "athletic")
-_SIZE_CUES = ("size", "petite", "plus size", "tall", "wide", "narrow", "slim",
-              "loose", "oversized", "fitted", "true to size")
-
-# Free-form word -> phrasings a product listing plausibly uses. The LLM supplies
-# these itself; this table only backs the degraded path.
-_SYNONYMS = {
-    "waterproof": ("water resistant", "waterproof", "weatherproof", "water-resistant"),
-    "warm": ("insulated", "fleece", "thermal", "warm"),
-    "breathable": ("breathable", "moisture wicking", "mesh"),
-    "workout": ("athletic", "performance", "activewear"),
-    "gym": ("athletic", "performance", "activewear"),
-    "rain": ("water resistant", "rain", "waterproof"),
-    "winter": ("insulated", "thermal", "winter"),
-    "stretchy": ("spandex", "elastane", "stretch"),
-    "comfy": ("comfortable", "soft"),
-    "comfortable": ("comfortable", "soft"),
-}
-
-
-def _tokens(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9']+", text.lower())
-
-
-def _find_budget(text: str) -> float | None:
-    lowered = text.lower()
-    match = re.search(r"\$\s*(\d+(?:\.\d+)?)", lowered)
-    if match:
-        return float(match.group(1))
-    match = re.search(r"(\d+(?:\.\d+)?)\s*(?:dollars|bucks|usd|quid|pounds)", lowered)
-    if match:
-        return float(match.group(1))
-    if any(cue in lowered for cue in _BUDGET_CUES):
-        match = re.search(r"(\d+(?:\.\d+)?)", lowered)
-        if match:
-            return float(match.group(1))
-        for word, value in _NUMBER_WORDS.items():
-            if word in lowered:
-                return float(value)
-    for word, value in _NUMBER_WORDS.items():
-        if f"{word} bucks" in lowered or f"{word} dollars" in lowered:
-            return float(value)
-    return None
-
-
-def _degraded(message: str, turn: int) -> dict:
-    """Rule-based reading. Never raises; never empty for a non-empty message."""
-    lowered = (message or "").lower()
-    constraints: list[dict] = []
-    claimed: set[str] = set()
-
-    def add(text: str, attribute: str, hard: bool, variants=()) -> None:
-        if text and text not in claimed and len(constraints) < _MAX_CONSTRAINTS:
-            claimed.add(text)
-            constraints.append({
-                "text": text, "attribute": attribute, "hard": hard,
-                "variants": list(variants) or [text],
-            })
-
-    budget = _find_budget(lowered)
-    if budget is not None:
-        add(f"budget around ${budget:g}", "budget", True, [f"budget around ${budget:g}"])
-
-    for word in _COLORS:
-        if re.search(rf"\b{word}\b", lowered):
-            add(word, "color", True, [f"color: {word}", word])
-    for word in _MATERIALS:
-        if re.search(rf"\b{word}\b", lowered):
-            add(word, "material", True, [word, f"100% {word}"])
-    for word in _USE_CASES:
-        if re.search(rf"\b{word}\b", lowered):
-            add(word, "use_case", True, _SYNONYMS.get(word, (word,)))
-    for cue in _SIZE_CUES:
-        if cue in lowered:
-            add(cue, "size", False, [cue])
-            break
-
-    # Anything left over becomes a low-confidence soft constraint, so a word we
-    # have no rule for still has a chance of matching catalog text.
-    for token in _tokens(lowered):
-        if len(constraints) >= _MAX_CONSTRAINTS:
-            break
-        if len(token) > 3 and token not in _STOPWORDS and token not in claimed:
-            add(token, "feature", False, _SYNONYMS.get(token, (token,)))
-
-    if not constraints and message and message.strip():
-        add(message.strip()[:80], "feature", False)
-
-    no_preference = None
-    if any(cue in lowered for cue in _NO_PREF_CUES):
-        no_preference = next(
-            (a for a in REACHABLE_ATTRIBUTES if a.replace("_", " ") in lowered), None
-        )
-
-    return {
-        "constraints": constraints,
-        "intent": "buying" if budget is not None else "browsing",
-        "override": any(cue in lowered for cue in _OVERRIDE_CUES),
-        "no_preference": no_preference,
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0},
-    }
-
-
-# --------------------------------------------------------------------------
-# vocabulary bridge
-# --------------------------------------------------------------------------
-
-def _resolve(text: str, variants: list[str]) -> str:
-    """First phrasing that actually exists in the catalog wins.
-
-    Returns "" when nothing resolves. That is a normal outcome, not an error:
-    the constraint is still carried and may be matched semantically later.
+    The coercion layer already absorbs every shape difference it knows about,
+    so anything reaching here is something the model has to be told. Quoting
+    its own output back is what makes the second attempt different from a
+    plain re-send, which would likely fail the same way.
     """
-    prep = preprocessing.active()
-    if prep is None:
-        return ""
-    for candidate in [*variants, text]:
-        key = preprocessing.normalize(candidate)
-        if key and prep.lookup(key, broad=True):
-            return key
-    return ""
+    return (f"{original}\n\n"
+            f"Your previous reply could not be parsed:\n"
+            f"---\n{(bad_output or '(empty)')[:600]}\n---\n"
+            f"Return ONLY the JSON object described above. No prose, no code "
+            f"fence, no trailing commas. Every attribute needs all of "
+            f'"attribute", "value" and "confidence".')
 
 
-def _build(data: dict, turn: int) -> Extraction:
-    constraints = [
-        Constraint(
-            text=item["text"],
-            key=_resolve(item["text"], item.get("variants") or []),
-            attribute=item["attribute"],
-            hard=bool(item["hard"]),
-            weight=1.0 if item["hard"] else _SOFT_WEIGHT,
-            turn=turn,
-        )
-        for item in data["constraints"]
-    ]
-    return Extraction(
-        constraints=constraints,
-        intent=data.get("intent", "browsing"),
-        override=bool(data.get("override")),
-        no_preference=data.get("no_preference"),
-        usage=dict(data.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0}),
-    )
+# --------------------------------------------------------------------------
+# the provider -- Anthropic only
+# --------------------------------------------------------------------------
+
+_MODEL = os.environ.get("TECHJAM_LLM_MODEL", "claude-opus-5")
+_ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0}
 
 
-def _known(state: SessionState | None) -> str:
-    if state is None or not state.constraints:
-        return ""
-    return ", ".join(c.text for c in state.constraints[-6:])
+@lru_cache(maxsize=1)
+def _client():
+    """The Anthropic client, or None when unavailable.
 
-
-def extract(message: str, turn: int, state: SessionState | None = None) -> Extraction:
-    """Parse one free-form customer message. Never raises."""
+    Returns None rather than raising for a missing package or missing key, so
+    an unconfigured checkout runs the deterministic path instead of dying
+    inside Agent.__init__ and scoring every session zero.
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
     try:
+        import anthropic          # LAZY: optional dependency, keep it that way
+    except ImportError:
+        return None
+    try:
+        # max_retries=0 because the evaluator has no timeout of its own: wall
+        # clock per turn must stay bounded by _TIMEOUT alone.
+        return anthropic.Anthropic(timeout=_TIMEOUT, max_retries=0)
+    except Exception:
+        return None
+
+
+_failures = 0
+
+
+def _llm_frame(message: str, turn: int, state: SessionState) -> _Frame | None:
+    """Ask Claude to read a message no template matched.
+
+    Two attempts. A malformed reply is retried with the bad output quoted back
+    and a corrective instruction, because the coercion layer has already
+    absorbed every shape difference it knows how to; whatever still fails is
+    something the model has to be told about. A transport failure is retried
+    plainly -- there is nothing to correct.
+
+    Wall clock is bounded by _TIMEOUT * _MAX_ATTEMPTS, which matters because
+    the evaluator imposes no timeout of its own.
+
+    Circuit breaker: after two consecutive failed turns the provider is
+    abandoned for the rest of the run, so a dead endpoint costs a few seconds
+    total rather than a few seconds per turn for a thousand sessions.
+    """
+    global _failures
+    client = _client()
+    if client is None or _failures >= _MAX_CONSECUTIVE_FAILURES:
+        return None
+
+    prompt = _user_prompt(message, turn, state)
+    spent = dict(_ZERO_USAGE)
+    reading = None
+
+    for _ in range(_MAX_ATTEMPTS):
+        try:
+            response = client.messages.create(
+                model=_MODEL,
+                max_tokens=1024,
+                system=_SYSTEM,
+                messages=[{"role": "user", "content": prompt}],
+                output_config={"effort": "low"},
+            )
+        except Exception:
+            continue        # transport failure: nothing to correct, just retry
+
+        # Every attempt costs tokens whether or not it parsed, so usage
+        # accumulates across the loop. Overwriting would under-report.
+        usage = getattr(response, "usage", None)
+        spent["prompt_tokens"] += max(0, int(getattr(usage, "input_tokens", 0) or 0))
+        spent["completion_tokens"] += max(0, int(getattr(usage, "output_tokens", 0) or 0))
+
+        raw = "".join(block.text for block in response.content
+                      if getattr(block, "type", "") == "text")
+        reading = _parse_reading(raw)
+        if reading is not None:
+            break
+        prompt = _correction_prompt(_user_prompt(message, turn, state), raw)
+
+    state.usage = spent
+    if reading is None:
+        _failures += 1
+        return None
+    _failures = 0
+
+    # Group by attribute: the model reports a wanted value and a negated value
+    # as separate entries sharing the same attribute, and one _Reading per
+    # attribute carries both -- e.g. "not leather" becomes
+    # _Reading(attribute="material", negated=["leather"]). Confidence on the
+    # wanted side comes from the model verbatim; rescaling it here would
+    # silently overrule its judgement of how sure the customer is.
+    by_attribute: dict[str, list] = {}
+    for item in reading.attributes:
+        by_attribute.setdefault(item.attribute, []).append(item)
+
+    readings = []
+    for attribute, items in by_attribute.items():
+        wanted = [i for i in items if not i.negated]
+        negated = [i.value for i in items if i.negated]
+        if wanted:
+            best = max(wanted, key=lambda i: i.confidence)
+            readings.append(_Reading(attribute=attribute, value=best.value,
+                                      confidence=best.confidence, negated=negated))
+        else:
+            readings.append(_Reading(attribute=attribute, negated=negated))
+
+    return _Frame(name="llm", readings=tuple(readings), buy_intent=float(reading.buy_intent))
+
+
+# --------------------------------------------------------------------------
+# pipeline -- the only place state is mutated
+# --------------------------------------------------------------------------
+
+def _apply(state: SessionState, frame: _Frame, turn: int) -> None:
+    """Fold one frame into the state: one bind (+ cascade) per reading.
+
+    category flows through this same loop as an ordinary attribute -- no
+    special case. Replacing it fires _cascade exactly like any other
+    attribute, which is what forgets the category-scoped slots (material,
+    style, ...) once the category itself has changed.
+    """
+    for reading in frame.readings:
+        attribute = reading.attribute
+
+        value = reading.value.strip()
+        if value:
+            key, resolution = _resolve(value)
+            confidence = (reading.confidence * resolution) if key else _CONF_UNRESOLVED
+            slot = state.slots.get(attribute)
+            replaced = slot is not None
+            state.bind(attribute, value, key, confidence, turn)
+            if replaced:
+                _cascade(state, attribute, turn)
+
+        for excluded in reading.negated:
+            excluded = excluded.strip()
+            if not excluded:
+                continue
+            key, _resolution = _resolve(excluded)
+            state.exclude(attribute, key or excluded)
+
+
+def extract(message: str, turn: int, state: SessionState | None = None) -> SessionState:
+    """Read one customer message into the session state."""
+    if state is None:
+        state = SessionState()
+    try:
+        state.begin_turn(turn)
         text = (message or "").strip()
         if not text:
-            return Extraction()
-        payload = _cached_call(text, int(turn), _known(state))
-        data = json.loads(payload) if payload else _degraded(text, turn)
-        return _build(data, turn)
+            return state
+        # Record before reading, so the LLM path sees this turn in context.
+        state.record_customer(turn, text)
+
+        frame = _llm_frame(text, turn, state)
+
+        _apply(state, frame, turn)
+        state.buy_intent = frame.buy_intent
+        return state
     except Exception:
-        # Absolute last resort: a miss is bad, an exception is worse.
-        try:
-            return _build(_degraded(str(message or ""), turn), turn)
-        except Exception:
-            return Extraction()
+        # A miss is bad; an exception loses the whole turn, recommendations
+        # included, because agent.respond() would never reach ask.decide().
+        return state
