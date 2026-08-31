@@ -28,5 +28,11 @@ tests/test_organizer_pipeline.py
 # local virtualenv for the optional sentence-transformers backend
 .venv/
 
-# nomic catalog embeddings (large, downloaded like data/catalog.jsonl)
+# Normalisation pipeline I/O -- rebuildable via dataset_normalisation.pipeline
+# in ~16s, EXCEPT labels.jsonl (the cached LLM labels). Do not track, do not delete.
+data/normalised/
+
+# nomic catalog embeddings -- large, rebuildable from embedder/embed.py.
+# Downloaded or built locally, like data/catalog.jsonl. Do not track.
 data/embeddings/
+data/catalog_sample_25.jsonl

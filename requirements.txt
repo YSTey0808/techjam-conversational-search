@@ -9,4 +9,15 @@ python-dotenv>=1.0
 # a provider SDK nor an API key is present.
 #   - Groq (TECHJAM_LLM_PROVIDER=groq): needs nothing here, it is raw urllib.
 #   - Anthropic (the default when ANTHROPIC_API_KEY is set): needs this.
-anthropic>=1.0
+#
+# Also used by the catalog normalisation pipeline:
+#   python -m dataset_normalisation.pipeline run --no-llm   stdlib only
+#   python -m dataset_normalisation.pipeline run            needs anthropic
+#
+# The major is capped deliberately: anthropic went 0.x -> 1.x with breaking
+# changes to the batches/types surface that pipeline calls, so an uncapped
+# install would silently break dataset_normalisation/columns/style_use_case.py.
+anthropic>=1.2,<2
+
+# Optional: only dataset_normalisation.pipeline.to_dataframe() needs this.
+pandas>=3.0,<4
