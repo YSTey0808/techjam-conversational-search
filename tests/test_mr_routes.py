@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 
@@ -112,6 +115,40 @@ class VectorCacheTest(unittest.TestCase):
             third = VectorStore(HashingEmbedder(), cache_dir=cache, catalog_path=path)
             third.build(index.embed_text[::-1], index.ids[::-1])
             self.assertFalse(third.loaded_from_cache)
+
+
+class PrecomputedVectorStoreTest(unittest.TestCase):
+    """load_precomputed adopts an offline matrix and aligns its rows to the
+    index order without touching an embedder."""
+
+    def _files(self, directory, matrix, ids):
+        mp = Path(directory) / "m.npy"
+        ip = Path(directory) / "m.json"
+        np.save(mp, matrix)
+        ip.write_text(json.dumps(ids), encoding="utf-8")
+        return str(mp), str(ip)
+
+    def test_rows_are_permuted_to_the_index_order(self) -> None:
+        with TemporaryDirectory() as d:
+            stored = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float32)
+            mp, ip = self._files(d, stored, ["C", "A", "B"])
+            store = VectorStore(HashingEmbedder())
+            out = store.load_precomputed(mp, ip, ["A", "B", "C"])
+            np.testing.assert_array_equal(out[0], [0.0, 1.0])   # was row "A"
+            np.testing.assert_array_equal(out[2], [1.0, 0.0])   # was row "C"
+            self.assertTrue(store.loaded_from_cache)
+
+    def test_a_row_count_mismatch_raises(self) -> None:
+        with TemporaryDirectory() as d:
+            mp, ip = self._files(d, np.zeros((2, 4), dtype=np.float32), ["A", "B", "C"])
+            with self.assertRaises(RuntimeError):
+                VectorStore(HashingEmbedder()).load_precomputed(mp, ip, ["A", "B", "C"])
+
+    def test_an_uncovered_product_raises(self) -> None:
+        with TemporaryDirectory() as d:
+            mp, ip = self._files(d, np.zeros((2, 4), dtype=np.float32), ["A", "B"])
+            with self.assertRaises(RuntimeError):
+                VectorStore(HashingEmbedder()).load_precomputed(mp, ip, ["A", "Z"])
 
 
 if __name__ == "__main__":

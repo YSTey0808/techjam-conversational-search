@@ -22,3 +22,6 @@ tests/test_organizer_pipeline.py
 
 # local virtualenv for the optional sentence-transformers backend
 .venv/
+
+# nomic catalog embeddings (large, downloaded like data/catalog.jsonl)
+data/embeddings/

@@ -15,9 +15,11 @@ more weight on fusion than the diagram implies.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from . import fuse
+from .embed import DEFAULT_EMBEDDINGS_DIR
 from .filters import HardFilter
 from .index import CatalogIndex
 from .routes.category import CategoryRoute
@@ -35,21 +37,46 @@ from .types import (
 POOL_LIMIT = 200
 
 
+def _numeric_sidecar(
+    catalog_path: str | Path,
+    explicit: str | Path | None,
+) -> str | Path | None:
+    """The raw catalog to read average_rating / rating_number from.
+
+    Explicit wins. Otherwise, when the primary catalog is the normalised table,
+    probe for the original ``catalog.jsonl`` beside it -- present in every repo
+    checkout -- so the popularity prior and rating gates keep working without
+    the caller wiring the second path by hand.
+    """
+    if explicit is not None:
+        return explicit
+    primary = Path(catalog_path)
+    sibling = primary.with_name("catalog.jsonl")
+    if sibling != primary and sibling.exists():
+        return sibling
+    return None
+
+
 class DualTrackRetriever:
     def __init__(
         self,
-        catalog_path: str | Path = "data/catalog.jsonl",
+        catalog_path: str | Path = "data/catalog_normalised.jsonl",
         *,
+        raw_catalog_path: str | Path | None = None,
         tracks: dict[str, TrackConfig] | None = None,
         fusion: str = "rrf",
         keyword_mode: str = "bm25",   # "bm25" | "seeded"
         layered: bool = True,
         pool_limit: int = POOL_LIMIT,
         embedder=None,
+        embeddings_dir: str | Path | None = DEFAULT_EMBEDDINGS_DIR,
         prior_weight: float = DEFAULT_WEIGHT,
         cache_dir: str = ".cache/multi_retrieval",
     ) -> None:
-        self.index = CatalogIndex(catalog_path)
+        self.index = CatalogIndex(
+            catalog_path,
+            raw_catalog_path=_numeric_sidecar(catalog_path, raw_catalog_path),
+        )
         self.tracks = dict(tracks or DEFAULT_TRACKS)
         self.fusion = fusion
         self.layered = layered
@@ -62,13 +89,42 @@ class DualTrackRetriever:
         self.filter = HardFilter(self.index)
         self.prior = PopularityPrior(self.index, weight=prior_weight)
 
-        # The vector route is optional: building it encodes the whole catalog,
-        # which is the one slow step in this package. Pass an embedder to enable
-        # it; leave it out and the two lexical routes carry the query.
+        # Three routes by default. The vector route:
+        #   * `embedder` given        -> encode the catalog live with it
+        #     (tests pass HashingEmbedder; slow with a real model)
+        #   * otherwise               -> adopt the precomputed nomic matrix in
+        #     `embeddings_dir` and encode queries with NomicEmbedder
+        # It falls back to two routes -- no error -- when the embedding files are
+        # absent, sentence-transformers is not installed, or the catalog is not
+        # the one the vectors were built for (a test fixture).
         self.vector = None
         if embedder is not None:
             from .routes.vector import VectorRoute
             self.vector = VectorRoute(self.index, embedder, cache_dir=cache_dir)
+        elif embeddings_dir is not None:
+            self.vector = self._precomputed_vector_route(embeddings_dir, cache_dir)
+
+    def _precomputed_vector_route(self, embeddings_dir, cache_dir):
+        base = Path(embeddings_dir)
+        matrix_path = base / "v2_nomic.npy"
+        ids_path = base / "v2_nomic_ids.json"
+        if not (matrix_path.exists() and ids_path.exists()):
+            return None
+        try:
+            stored = len(json.loads(ids_path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return None
+        if stored != self.index.size:
+            return None                       # not this catalog's vectors
+        try:
+            from .embed import NomicEmbedder
+            from .routes.vector import VectorRoute
+            return VectorRoute(
+                self.index, NomicEmbedder(), cache_dir=cache_dir,
+                precomputed=(str(matrix_path), str(ids_path)),
+            )
+        except ImportError:
+            return None                       # deps not installed: run without it
 
     # --------------------------------------------------------------- retrieve
 

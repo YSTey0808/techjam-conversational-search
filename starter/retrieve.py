@@ -45,7 +45,18 @@ USE_MULTI_RETRIEVAL = True
 # multi_retrieval builds its own index and needs the catalog file, which
 # Preprocessing does not record. Override with TECHJAM_CATALOG if you run the
 # evaluator against a different one.
+#
+# The routes and hard filter build from the NORMALISED faceted table; the
+# original export is still handed over as the numeric sidecar so the popularity
+# prior and rating gates have average_rating / rating_number to read.
 _CATALOG_PATH = os.environ.get("TECHJAM_CATALOG", "data/catalog.jsonl")
+_NORMALISED_PATH = os.environ.get(
+    "TECHJAM_CATALOG_NORMALISED", "data/catalog_normalised.jsonl"
+)
+# Precomputed nomic catalog vectors. If present (and sentence-transformers is
+# installed) the vector route turns on; otherwise the two lexical routes carry
+# the query and nothing here changes.
+_EMBEDDINGS_DIR = os.environ.get("TECHJAM_EMBEDDINGS", "data/embeddings")
 
 # How many candidates to hand rank.py. Matches the original _FUSE_LIMIT so the
 # downstream stages see a pool of the size they were tuned against.
@@ -226,12 +237,17 @@ def _multi_retriever(prep: Preprocessing):
     if _RETRIEVER is None:
         from multi_retrieval import DualTrackRetriever
 
-        retriever = DualTrackRetriever(_CATALOG_PATH)
+        primary = _NORMALISED_PATH if os.path.exists(_NORMALISED_PATH) else _CATALOG_PATH
+        embeddings = _EMBEDDINGS_DIR if os.path.isdir(_EMBEDDINGS_DIR) else None
+        retriever = DualTrackRetriever(
+            primary, raw_catalog_path=_CATALOG_PATH, embeddings_dir=embeddings,
+        )
         if retriever.index.size != prep.n_docs:
             raise RuntimeError(
                 f"catalog mismatch: multi_retrieval indexed {retriever.index.size} "
-                f"products from {_CATALOG_PATH!r}, but preprocessing loaded "
-                f"{prep.n_docs}. Set TECHJAM_CATALOG to the catalog actually in use."
+                f"products from {primary!r}, but preprocessing loaded "
+                f"{prep.n_docs}. Set TECHJAM_CATALOG / TECHJAM_CATALOG_NORMALISED "
+                f"to the catalog actually in use."
             )
         _RETRIEVER = retriever
     return _RETRIEVER

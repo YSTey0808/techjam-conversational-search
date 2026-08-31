@@ -145,8 +145,10 @@ def parse_args() -> argparse.Namespace:
                         help="skip the hard-constraint layer entirely")
     parser.add_argument("--list-width", type=int, default=10)
     parser.add_argument("--vector", default="off",
-                        choices=("off", "hashing", "sentence-transformers"),
-                        help="which embedder backs the vector route")
+                        choices=("off", "hashing", "sentence-transformers", "nomic"),
+                        help="which backend drives the vector route ('nomic' "
+                             "adopts data/embeddings/v2_nomic.npy)")
+    parser.add_argument("--embeddings-dir", default="data/embeddings")
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
 
@@ -155,17 +157,20 @@ def main() -> None:
     args = parse_args()
 
     embedder = None
+    embeddings_dir = None
     if args.vector == "hashing":
         from multi_retrieval.embed import HashingEmbedder
         embedder = HashingEmbedder()
     elif args.vector == "sentence-transformers":
         from multi_retrieval.embed import SentenceTransformerEmbedder
         embedder = SentenceTransformerEmbedder()
+    elif args.vector == "nomic":
+        embeddings_dir = args.embeddings_dir
 
     started = time.monotonic()
     retriever = DualTrackRetriever(
         args.catalog, fusion=args.fusion, layered=not args.no_layered,
-        embedder=embedder,
+        embedder=embedder, embeddings_dir=embeddings_dir,
     )
     build_seconds = time.monotonic() - started
 

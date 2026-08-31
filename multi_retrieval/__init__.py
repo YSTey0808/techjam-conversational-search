@@ -6,7 +6,9 @@ so the two can be measured against each other honestly.
 
     from multi_retrieval import DualTrackRetriever, DualQuery, Slots
 
-    retriever = DualTrackRetriever("data/catalog.jsonl")
+    # normalised faceted table; the original catalog.jsonl beside it is picked
+    # up automatically as the average_rating / rating_number sidecar
+    retriever = DualTrackRetriever("data/catalog_normalised.jsonl")
     result = retriever.retrieve(DualQuery(
         slots=Slots(category="Jewelry Necklaces", material="alloy"),
         intent="buying",

@@ -1,22 +1,30 @@
 """Dense vectors for the semantic route.
 
-Two backends behind one protocol:
+The catalog side is precomputed offline with ``nomic-ai/nomic-embed-text-v1.5``
+(768-dim, 2048-token context) and shipped as ``data/embeddings/v2_nomic.npy`` --
+50,000 x 768 L2-normalised float32, row-aligned with the catalog. Encoding it
+live takes ~40 minutes, so it is never rebuilt; ``VectorStore.load_precomputed``
+adopts it directly.
 
-* ``SentenceTransformerEmbedder`` — the real one. A pretrained sentence encoder,
-  held in memory. Permitted by the track rules: dense retrieval is explicitly in
-  scope, only "heavy external industrial vector DB clusters" are excluded, and a
-  pretrained encoder is not the "full-parameter fine-tuning" that is out of
-  scope. 50,000 x 384 float32 is 77 MB resident and one query is a single
-  matmul, which is comfortably "in-memory for light execution".
+Only the query is embedded at request time. Backends behind one protocol:
+
+* ``NomicEmbedder`` — the real one. Wraps the same nomic model the catalog
+  vectors were built with, and always applies the ``search_query:`` task prefix
+  the model expects (omitting it silently halves relevance). Needs
+  ``sentence-transformers`` + ``einops``.
 
 * ``HashingEmbedder`` — a dependency-free fallback so this package imports and
-  its tests run on a machine with nothing installed. It is lexical underneath,
-  so it cannot do the cross-category semantic matching the real encoder can.
-  A fallback, never the default.
+  its tests run on a machine with nothing installed. Lexical underneath, so it
+  cannot do the cross-category semantic matching the real encoder can, and it
+  is dimension-incompatible with the precomputed matrix. A fallback for the
+  live-build path only, never used against ``v2_nomic.npy``.
 
-Catalog vectors are expensive to compute and never change, so they are cached to
-disk and keyed by a fingerprint of the catalog file plus the model name. The
-stored id order is verified before the cache is trusted.
+* ``SentenceTransformerEmbedder`` — a generic wrapper kept for
+  ``scripts/score_multi_retrieval.py``'s ``--vector sentence-transformers``.
+
+Live-built catalog vectors are cached to disk keyed by a fingerprint of the
+catalog file plus the model name; the stored id order is verified before the
+cache is trusted.
 """
 
 from __future__ import annotations
@@ -30,6 +38,9 @@ from typing import Protocol
 import numpy as np
 
 DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+NOMIC_MODEL = "nomic-ai/nomic-embed-text-v1.5"
+NOMIC_QUERY_PREFIX = "search_query: "
+DEFAULT_EMBEDDINGS_DIR = "data/embeddings"
 DEFAULT_CACHE = ".cache/multi_retrieval"
 HASHING_DIMENSION = 512
 
@@ -74,6 +85,40 @@ class SentenceTransformerEmbedder:
         vectors = self._model.encode(
             texts,
             batch_size=self.batch_size,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return vectors.astype(np.float32)
+
+
+class NomicEmbedder:
+    """Query encoder matching the precomputed nomic-embed-text-v1.5 catalog.
+
+    Only ever encodes the query, so it unconditionally prepends the
+    ``search_query:`` prefix. The catalog vectors used ``search_document:`` when
+    they were built; the two prefixes are what make asymmetric retrieval work.
+    """
+
+    def __init__(self, model_name: str = NOMIC_MODEL, *, device: str | None = None) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as error:                      # pragma: no cover
+            raise ImportError(
+                "sentence-transformers (and einops) are needed for the nomic "
+                "query encoder. `pip install -r requirements-multi-retrieval.txt`, "
+                "or run without the vector route."
+            ) from error
+        self._model = SentenceTransformer(model_name, trust_remote_code=True, device=device)
+        self.name = model_name
+        getter = getattr(self._model, "get_embedding_dimension", None) or \
+            self._model.get_sentence_embedding_dimension
+        self.dimension = int(getter())
+
+    def encode(self, texts: list[str]) -> np.ndarray:
+        prefixed = [NOMIC_QUERY_PREFIX + text for text in texts]
+        vectors = self._model.encode(
+            prefixed,
             convert_to_numpy=True,
             normalize_embeddings=True,
             show_progress_bar=False,
@@ -179,6 +224,39 @@ class VectorStore:
         self.loaded_from_cache = False
         return matrix
 
+    def load_precomputed(
+        self,
+        matrix_path: str | Path,
+        ids_path: str | Path,
+        index_ids: list[str],
+    ) -> np.ndarray:
+        """Adopt a catalog matrix built offline instead of encoding one now.
+
+        The stored ids are matched against the index order and the rows are
+        permuted to agree; a stored id set that does not cover the catalog is
+        an error, not a silent partial match.
+        """
+        matrix = np.load(matrix_path)
+        stored = json.loads(Path(ids_path).read_text(encoding="utf-8"))
+        if matrix.shape[0] != len(stored):
+            raise RuntimeError(
+                f"{Path(matrix_path).name}: {matrix.shape[0]} rows but "
+                f"{Path(ids_path).name} lists {len(stored)} ids"
+            )
+        if stored != list(index_ids):
+            position = {asin: row for row, asin in enumerate(stored)}
+            try:
+                order = [position[asin] for asin in index_ids]
+            except KeyError as error:
+                raise RuntimeError(
+                    f"precomputed embeddings do not cover product "
+                    f"{error.args[0]!r}"
+                ) from error
+            matrix = matrix[order]
+        self.matrix = np.ascontiguousarray(matrix, dtype=np.float32)
+        self.loaded_from_cache = True
+        return self.matrix
+
     def similarity(self, query: np.ndarray) -> np.ndarray:
         if self.matrix is None:
             raise RuntimeError("build() must run before similarity()")
@@ -186,6 +264,7 @@ class VectorStore:
 
 
 __all__ = [
-    "Embedder", "SentenceTransformerEmbedder", "HashingEmbedder",
-    "VectorStore", "DEFAULT_MODEL", "DEFAULT_CACHE",
+    "Embedder", "NomicEmbedder", "SentenceTransformerEmbedder", "HashingEmbedder",
+    "VectorStore", "DEFAULT_MODEL", "NOMIC_MODEL", "DEFAULT_EMBEDDINGS_DIR",
+    "DEFAULT_CACHE",
 ]

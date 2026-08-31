@@ -20,19 +20,19 @@ INTENTS = (BUYING, BROWSING)
 # softer ones second. These two groups are what that question is about; the
 # split is a default that DualTrackRetriever can override.
 #
-# `category` is NOT here by default, and this was the single most expensive
-# mistake in this package. With an INFERRED category filtering the pool, the
-# target survived only 8% of turns in the sessions multi_retrieval failed -- while a
-# route had already surfaced it 99.2% of the time. Requiring a product's path to
-# carry every word of a guessed "Active Shirts & Tees T-Shirts" throws away the
-# right answer, and backoff never notices because the pool is not empty, just
-# wrong. Measured inside the pipeline: 0.7478 filtering, 0.8601 not.
+# Only `brand` and `department` gate by default -- they map onto the clean,
+# dense `brand` and `audience` facets of the normalised catalog, where an exact
+# match is safe. `item` is NOT a gate: it is a free phrase that will not equal
+# one of the 8 category enums, so it feeds the routes instead.
 #
-# A VERBATIM category is a different thing and is worth filtering on: measured
-# 0.7573 not filtering against 0.8396 filtering. Callers opt in per query with
-# Slots.category_trusted.
-HARD_SLOTS = ("item", "brand", "department")
-SOFT_SLOTS = ("color", "material", "size", "fit", "occasion",
+# `category` joins only when the customer said it verbatim (Slots.category_
+# trusted). Filtering on an INFERRED category was the single most expensive
+# mistake in this package: the target survived only 8% of turns in the sessions
+# multi_retrieval failed, while a route had already surfaced it 99.2% of the
+# time. Measured inside the pipeline: 0.7478 filtering, 0.8601 not. A verbatim
+# category is the other way round -- 0.7573 not filtering against 0.8396.
+HARD_SLOTS = ("brand", "department")
+SOFT_SLOTS = ("item", "color", "material", "size", "fit", "occasion",
               "season", "performance", "care", "style", "pattern")
 
 

@@ -1,2 +1,7 @@
-numpy>=1.26,<2
-sentence-transformers>=2.7,<4
+# Optional: only the vector route needs these. The two lexical routes and the
+# hard filter run on numpy alone.
+numpy>=1.26
+sentence-transformers>=2.7
+# nomic-embed-text-v1.5 is loaded with trust_remote_code=True and its modeling
+# code imports einops.
+einops>=0.7
