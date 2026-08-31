@@ -1,0 +1,9 @@
+# Required. starter/extract.py validates LLM output through pydantic models.
+pydantic>=2.13
+
+# Loads .env so ANTHROPIC_API_KEY doesn't need to be exported by hand.
+python-dotenv>=1.0
+
+# The LLM path. The import in starter/extract.py is lazy, so the agent still
+# runs (with no model calls) if this or the API key is missing.
+anthropic>=1.0

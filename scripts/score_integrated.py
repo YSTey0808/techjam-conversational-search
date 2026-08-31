@@ -29,7 +29,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluator.local_evaluator import catalog_index, evaluate, load_jsonl  # noqa: E402
-from starter import ask, extract, preprocessing, rank  # noqa: E402
+from reranker import adapter  # noqa: E402
+from starter import ask, extract, preprocessing  # noqa: E402
 from starter import state as state_mod  # noqa: E402
 from starter.schema import SessionState  # noqa: E402
 
@@ -157,12 +158,18 @@ class BaseAgent:
 
 
 class TheirAgent(BaseAgent):
-    """Unchanged baseline: their retrieve + their rank."""
+    """Their retrieve + the reranker.
+
+    This was the pre-reranker baseline (retrieve + starter/rank.py). rank.py has
+    been deleted, so the row now measures retrieve + reranker/adapter.py and is
+    no longer a fixed reference point for the old IDF + popularity + budget
+    scoring -- compare against a recorded number, not against this row.
+    """
 
     def _pool(self, state, message, size):
         from starter import retrieve
         candidates = retrieve.retrieve(self.prep, state)
-        return rank.rank(self.prep, state, candidates, size)
+        return adapter.rerank(self.prep, state, candidates, size)
 
 
 class MultiRetrievalAgent(BaseAgent):
@@ -196,17 +203,18 @@ class MultiRetrievalAgent(BaseAgent):
 
 
 class MultiRetrievalPoolAgent(MultiRetrievalAgent):
-    """multi_retrieval as pure candidate generation; their rank.py orders it.
+    """multi_retrieval as pure candidate generation; the reranker orders it.
 
     This is what the architecture diagram actually draws: routes feed a candidate
-    pool, and a separate stage ranks it. rank.py is Owner D and independent of
-    Owner C, so the two can be mixed. It also means multi_retrieval's own fusion
-    order is thrown away and replaced by their IDF + popularity + budget scoring.
+    pool, and a separate stage ranks it. The ranking stage is Owner D and
+    independent of Owner C, so the two can be mixed. It also means
+    multi_retrieval's own fusion order is thrown away and replaced by the
+    reranker's RRF fusion (and its LLM step, when a key is present).
     """
 
     def _pool(self, state, message, size):
         candidates = super()._pool(state, message, self.retriever.pool_limit)
-        return rank.rank(self.prep, state, candidates, size)
+        return adapter.rerank(self.prep, state, candidates, size)
 
 def scenario_score(metrics: dict) -> float:
     efficiency = max(0.0, min(1.0, (11.0 - metrics["mttc"]) / 10.0))
@@ -229,9 +237,9 @@ def main() -> None:
     print("-" * len(header))
 
     variants = []
-    stages = (("their retrieve + rank", TheirAgent),
+    stages = (("their retrieve + reranker", TheirAgent),
               ("multi_retrieval/ own ranking", MultiRetrievalAgent),
-              ("multi_retrieval/ + their rank.py", MultiRetrievalPoolAgent))
+              ("multi_retrieval/ + reranker", MultiRetrievalPoolAgent))
 
     for label, factory in stages:
         variants.append((label + "  [real extract]", factory, False))

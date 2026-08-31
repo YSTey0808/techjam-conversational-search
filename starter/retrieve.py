@@ -21,7 +21,7 @@ import math
 import os
 
 from starter.preprocessing import Preprocessing
-from starter.schema import Constraint, SessionState
+from starter.schema import SessionState, Slot
 
 # ---------------------------------------------------------------------------
 # Candidate generation is delegated to the multi_retrieval package.
@@ -32,10 +32,11 @@ from starter.schema import Constraint, SessionState
 #     _original_retrieve + rank.py       0.5560
 #     multi_retrieval    + rank.py       0.6995
 #
-# Ranking is deliberately NOT taken over: agent.py already calls rank.rank()
-# after this function, and letting it score the pool is worth another 0.03 over
-# multi_retrieval ordering the results itself. This function's job is to decide
-# WHICH candidates rank.py sees, nothing more.
+# Ranking is deliberately NOT taken over: agent.py calls the reranker
+# (reranker/adapter.py) after this function, and letting a separate stage score
+# the pool was worth another 0.03 over multi_retrieval ordering the results
+# itself. This function's job is to decide WHICH candidates it sees, nothing
+# more. The numbers above predate the reranker -- rank.py was the scorer then.
 #
 # Flip this to False to restore the original implementation, which is preserved
 # below as _original_retrieve. Nothing else needs changing.
@@ -58,9 +59,9 @@ _NORMALISED_PATH = os.environ.get(
 # the query and nothing here changes.
 _EMBEDDINGS_DIR = os.environ.get("TECHJAM_EMBEDDINGS", "data/embeddings")
 
-# How many candidates to hand rank.py. Matches the original _FUSE_LIMIT so the
-# downstream stages see a pool of the size they were tuned against.
-_POOL_SIZE = 200
+# How many candidates to hand the reranker. Matches the original _FUSE_LIMIT so
+# the downstream stages see a pool of the size they were tuned against.
+_POOL_SIZE = 50000
 
 # Their Constraint.attribute vocabulary -> multi_retrieval slot names. The two
 # line up because both are typed by attribute; "use_case" has no direct slot so
@@ -87,7 +88,7 @@ _WEIGHTS = {
 _DEFAULT_WEIGHTS = _WEIGHTS["browsing"]
 
 _ROUTE_LIMIT = 500      # per-route cap before fusion
-_FUSE_LIMIT = 200       # candidates handed to rank.py
+_FUSE_LIMIT = 200       # candidates handed to the reranker
 _FALLBACK_LIMIT = 200
 
 
@@ -97,19 +98,19 @@ _FALLBACK_LIMIT = 200
 
 def _intersect(
     prep: Preprocessing,
-    constraints: list[Constraint],
+    slots: list[Slot],
     seed: set[str] | None,
     broad: bool,
 ) -> set[str] | None:
     """Intersect posting lists into `seed`. None means it collapsed to empty.
 
-    An unmatched constraint is SKIPPED, never intersected: a string we cannot
-    find is our indexing failure, not evidence the product does not exist.
+    An unmatched slot is SKIPPED, never intersected: a string we cannot find is
+    our indexing failure, not evidence the product does not exist.
     Intersecting on an empty posting list would destroy the pool.
     """
     pool = None if seed is None else set(seed)
-    for constraint in constraints:
-        postings = prep.lookup(constraint.key, broad=broad)
+    for slot in slots:
+        postings = prep.lookup(slot.key, broad=broad)
         if not postings:
             continue
         pool = set(postings) if pool is None else (pool & postings)
@@ -119,13 +120,18 @@ def _intersect(
 
 
 def _score_matches(prep: Preprocessing, state: SessionState, pool: set[str]) -> dict[str, float]:
-    """Summed IDF of every constraint each candidate actually matches."""
+    """Summed IDF of every slot each candidate actually matches.
+
+    `confidence_score` carries the weight the old `Constraint.weight` did: it is
+    already 0..1 and already says how firmly the customer wants this, so a
+    separate hard/soft weight would just be a coarser copy of it.
+    """
     scores = {asin: 0.0 for asin in pool}
-    for constraint in state.constraints:
-        if not constraint.key:
+    for slot in state.filled_slots.values():
+        if not slot.key:
             continue
-        weight = constraint.weight * prep.idf(constraint.key)
-        matched = prep.lookup(constraint.key, broad=True)
+        weight = (slot.confidence_score or 0.0) * prep.idf(slot.key)
+        matched = prep.lookup(slot.key, broad=True)
         for asin in pool:
             if asin in matched:
                 scores[asin] += weight
@@ -144,10 +150,10 @@ def _keyword(prep: Preprocessing, state: SessionState) -> dict[str, float]:
       3. drop the category gate LAST -- it is the cheapest evidence to lose
          only because it is also the least likely to be wrong
     """
-    hard = [c for c in state.constraints if c.hard and c.key]
+    hard = [s for s in state.hard_slots.values() if s.key]
     if not hard:
         return {}
-    ordered = sorted(hard, key=lambda c: prep.idf(c.key), reverse=True)
+    ordered = sorted(hard, key=lambda s: prep.idf(s.key), reverse=True)
     category_pool = prep.category_pool(state.category)
 
     for use_category in (True, False):
@@ -230,8 +236,9 @@ def _multi_retriever(prep: Preprocessing):
 
     Indexing 50,000 products takes a little over a second, so this must not
     happen per turn. The catalog is checked against the one Preprocessing
-    loaded: indexing a different file would produce candidates that rank.py
-    and ask.py cannot resolve, and it would fail silently rather than loudly.
+    loaded: indexing a different file would produce candidates that the
+    reranker and ask.py cannot resolve, and it would fail silently rather
+    than loudly.
     """
     global _RETRIEVER
     if _RETRIEVER is None:
@@ -265,20 +272,25 @@ def _slots_from(state: SessionState):
     from multi_retrieval import Slots
 
     slots = Slots(category=state.category or "")
-    for constraint in state.constraints:
-        name = _ATTRIBUTE_TO_SLOT.get(constraint.attribute)
+    for attribute, slot in state.filled_slots.items():
+        # `category` is unmapped and so lands in free_text, as it did before:
+        # Slots.category feeds the category route, free_text feeds the keyword
+        # route, and both want those words.
+        name = _ATTRIBUTE_TO_SLOT.get(attribute)
         if name and not getattr(slots, name):
-            setattr(slots, name, constraint.text)
-        elif constraint.text not in slots.free_text:
-            slots.free_text.append(constraint.text)
+            setattr(slots, name, str(slot.val))
+        elif isinstance(slot.val, str) and slot.val not in slots.free_text:
+            # Only text reaches free_text. `budget` binds a float, and "31.5"
+            # in the BM25 expression is noise, not a term.
+            slots.free_text.append(slot.val)
     return slots
 
 
 def retrieve(prep: Preprocessing, state: SessionState) -> list[str]:
     """Find the candidate products.  <- the only public name
 
-    Same contract as before: returns roughly 200 parent_asins for rank.py to
-    score. See USE_MULTI_RETRIEVAL at the top of this file.
+    Same contract as before: returns roughly 200 parent_asins for the reranker
+    to score. See USE_MULTI_RETRIEVAL at the top of this file.
     """
     if not USE_MULTI_RETRIEVAL:
         return _original_retrieve(prep, state)
