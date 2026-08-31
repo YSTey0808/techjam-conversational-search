@@ -169,7 +169,7 @@ class TheirAgent(BaseAgent):
     def _pool(self, state, message, size):
         from starter import retrieve
         candidates = retrieve.retrieve(self.prep, state)
-        return adapter.rerank(self.prep, state, candidates, size)
+        return adapter.rerank(self.prep, state, candidates, size, False)
 
 
 class MultiRetrievalAgent(BaseAgent):
@@ -214,7 +214,7 @@ class MultiRetrievalPoolAgent(MultiRetrievalAgent):
 
     def _pool(self, state, message, size):
         candidates = super()._pool(state, message, self.retriever.pool_limit)
-        return adapter.rerank(self.prep, state, candidates, size)
+        return adapter.rerank(self.prep, state, candidates, size, False)
 
 def scenario_score(metrics: dict) -> float:
     efficiency = max(0.0, min(1.0, (11.0 - metrics["mttc"]) / 10.0))

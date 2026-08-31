@@ -42,7 +42,7 @@ class Agent:
         state = extract.extract(user_message, turn, self._sessions[session_id])
         pool = retrieve.retrieve(self.prep, state)
         policy = ask.decide(self.prep, state, pool, turn)
-        items = adapter.rerank(self.prep, state, pool, policy.list_width)
+        items = adapter.rerank(self.prep, state, pool, policy.list_width, False)
         state.record_agent(policy.message, policy.ask_attribute)
         self._sessions[session_id] = state
         return {

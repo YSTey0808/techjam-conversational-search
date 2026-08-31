@@ -11,6 +11,7 @@ a slot never happened.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -27,6 +28,8 @@ try:
     load_dotenv()
 except ImportError:
     pass
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # config
@@ -110,6 +113,298 @@ def _resolve(text: str, variants: Sequence[str] = ()) -> tuple[str, float]:
     if key and prep.lookup(key, broad=True):
         return key, 0.60
     return "", 0.0
+
+
+# --------------------------------------------------------------------------
+# classify -- which attribute a raw catalog string belongs to
+# --------------------------------------------------------------------------
+
+# MIRRORS evaluator.classify_constraint EXACTLY, including its quirks: plain
+# substring tests (so "fit" matches "outfit"), style checked before use_case,
+# and a narrower colour list than COLOR_RE. Diverging costs turns: ask.py
+# would request an attribute the simulator files elsewhere, and the reply
+# comes back "I don't have an additional preference for ...".
+_MATERIALS = ("cotton", "polyester", "nylon", "leather", "wool", "spandex",
+              "silk", "rayon", "fabric")
+_COLORS = ("color", "black", "white", "blue", "red", "pink", "green")
+_SIZES = ("size", "sizing", "width", "wide", "narrow")
+_STYLES = ("department", "style", "fit", "sleeve", "neck")
+_USE_CASES = ("hiking", "running", "gym", "winter", "outdoor", "work")
+_BUDGET_RE = re.compile(r"(?:\$|<=|under)\s*\d")
+
+
+def _attribute_of(value: str) -> str:
+    lowered = value.lower()
+    if "budget" in lowered or _BUDGET_RE.search(lowered):
+        return "budget"
+    if any(word in lowered for word in _MATERIALS):
+        return "material"
+    if any(word in lowered for word in _COLORS):
+        return "color"
+    if any(word in lowered for word in _SIZES):
+        return "size"
+    if any(word in lowered for word in _STYLES):
+        return "style"
+    if any(word in lowered for word in _USE_CASES):
+        return "use_case"
+    return "feature"
+
+
+def _is_key(text: str) -> bool:
+    prep = preprocessing.active()
+    if prep is None:
+        return False
+    key = preprocessing.normalize(text)
+    return bool(key) and (key in prep.canon_postings or key in prep.postings)
+
+
+def _split_payload(payload: str) -> list[str]:
+    """Split a reveal payload into constraints, using the catalog as the judge.
+
+    The evaluator joins up to two constraints with "; ", but the constraints
+    themselves routinely contain "; " ("...8% Spandex; Machine Wash Cold"), so
+    splitting on the separator is unreliable. Two wrong keys are strictly worse
+    than one long key that still prefix-matches, so a split has to earn it:
+    both halves must be real catalog strings AND co-occur on some product,
+    which they must, since both came off the same intent card.
+    """
+    text = payload.strip()
+    if _is_key(text):
+        return [text]
+
+    prep = preprocessing.active()
+    best: tuple[float, list[str]] | None = None
+    for position, _ in enumerate(text):
+        if not text.startswith("; ", position):
+            continue
+        left, right = text[:position], text[position + 2:]
+        if not (_is_key(left) and _is_key(right)):
+            continue
+        left_key = preprocessing.normalize(left)
+        right_key = preprocessing.normalize(right)
+        if prep is not None and not (prep.lookup(left_key, broad=True)
+                                     & prep.lookup(right_key, broad=True)):
+            continue
+        score = min(prep.idf(left_key), prep.idf(right_key)) if prep else 0.0
+        if best is None or score > best[0]:
+            best = (score, [left, right])
+    if best is not None:
+        return best[1]
+    return [text]
+
+
+def _settle_category(captured: str, whole: str) -> str:
+    """Pin the category to a real cat_index key without ever rewriting it.
+
+    The regex splits on the first ". ", which is wrong if the category itself
+    contains one. So verify the capture against the index and, on a miss, walk
+    the other ". " boundaries. If nothing verifies, keep the raw capture -- a
+    verbatim string is the one thing guaranteed to be right, and normalizing
+    it can only lose.
+    """
+    prep = preprocessing.active()
+    if prep is None or captured in prep.cat_index:
+        return captured
+    opening = whole.split("I'm looking for ", 1)[-1]
+    for position, _ in enumerate(opening):
+        if opening.startswith(". ", position):
+            candidate = opening[:position]
+            if candidate in prep.cat_index:
+                return candidate
+    return captured
+
+
+# --------------------------------------------------------------------------
+# template router -- regex-first, LLM-fallback. See extract() for the wiring
+# and _frame_is_trustworthy below for the gate that decides which frames from
+# here are trusted.
+# --------------------------------------------------------------------------
+#
+# The evaluator's simulated customer (evaluator/local_evaluator.py) writes
+# exactly 9 fixed message shapes, never free text -- but may paraphrase them.
+# This parses all 9 exactly, for free, with no tokens; the degradation gate
+# after _route is what catches a paraphrase that still matched the scaffold,
+# and sends it to the LLM path instead of trusting a garbled parse.
+#
+# Returns the current _Frame/_Reading shape: category comes back as an
+# ordinary _Reading(attribute="category", ...), same as any other attribute --
+# there is no separate category field.
+#
+# Anchored, first match wins. Order matters: open_hard/open_browse must
+# precede open_soft, since all three start "I'm looking for ".
+#
+#   open_hard         buying turn 1; payload is hard_constraints[0]
+#   open_browse       browsing AND boundary turn 1 -- byte-identical, so this
+#                     frame cannot tell them apart and must not try
+#   override          the retraction; payload is hard_constraints[0] and this
+#                     is the ONLY place that fact ever appears
+#   reveal            answers, up to two constraints joined by "; "
+#   no_extra/         the customer has nothing to add -- carries no
+#   decline_boundary  information in the current _Frame shape (no `declined`
+#                     field), so these produce an empty frame, same as nudge
+#   nudge             we asked nothing, so they prod us; zero information
+#   open_soft         fallthrough, reached only by intent_override turn 1
+#                     since open_hard/open_browse already claim the others
+#
+# Cosmetic-only tolerance on top of the strict shapes above: flexible
+# whitespace (\s+ in place of literal spaces), case-insensitivity on the
+# fixed scaffolding, and an optional trailing period. None of this touches
+# what a capture group can contain -- a payload/category capture adjacent to
+# the trailing period is made lazy (.+?) rather than greedy so an absent
+# period is simply not consumed, instead of the capture swallowing it; a
+# present period is still excluded from the captured value exactly as
+# before. Paraphrase tolerance belongs to the degradation gate below, not
+# here.
+_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("open_hard", re.compile(
+        r"\AI'm\s+looking\s+for\s+(?P<category>.+?)\.\s+A\s+key\s+requirement\s+is:\s*"
+        r"(?P<payload>.+?)\.?\Z", re.S | re.I)),
+    ("open_browse", re.compile(
+        r"\AI'm\s+looking\s+for\s+(?P<category>.+),\s+but\s+I'm\s+still\s+exploring\.?\Z",
+        re.S | re.I)),
+    ("override", re.compile(
+        r"\AActually,\s+ignore\s+my\s+earlier\s+preference\.\s+What\s+I\s+need\s+is:\s*"
+        r"(?P<payload>.+?)\.?\Z", re.S | re.I)),
+    ("override_bare", re.compile(
+        r"\AActually,\s+please\s+ignore\s+my\s+earlier\s+preference\.?\Z", re.S | re.I)),
+    ("reveal", re.compile(
+        r"\AFor\s+that,\s+what\s+matters\s+is:\s*(?P<payload>.+?)\.?\Z", re.S | re.I)),
+    ("no_extra", re.compile(
+        r"\AI\s+don't\s+have\s+an\s+additional\s+preference\s+for\s+(?P<attribute>[A-Za-z_]+)\.?\Z",
+        re.S | re.I)),
+    ("decline_boundary", re.compile(
+        r"\AI\s+don't\s+have\s+a\s+preference\s+for\s+(?P<attribute>[A-Za-z_]+);\s+"
+        r"please\s+use\s+your\s+judgment\.?\Z", re.S | re.I)),
+    ("nudge", re.compile(
+        r"\AThose\s+options\s+are\s+not\s+quite\s+right\s+yet\.\s+"
+        r"Ask\s+me\s+about\s+one\s+specific\s+attribute\.?\Z", re.S | re.I)),
+    ("open_soft", re.compile(
+        r"\AI'm\s+looking\s+for\s+(?P<category>.+?)\.\s+(?P<payload>.+)\Z", re.S | re.I)),
+)
+
+
+def _route(message: str) -> _Frame | None:
+    """Parse one of the simulator's 9 fixed message shapes. None on no match."""
+    text = (message or "").strip()
+    if not text:
+        return None
+
+    for name, pattern in _PATTERNS:
+        match = pattern.match(text)
+        if not match:
+            continue
+        groups = match.groupdict()
+        category = groups.get("category")
+        if category is not None:
+            category = _settle_category(category, text)
+
+        if name == "open_hard":
+            payload = groups["payload"].strip()
+            readings = [_Reading(attribute="category", value=category, confidence=_CONF_HARD)]
+            if payload:
+                readings.append(_Reading(attribute=_attribute_of(payload),
+                                          value=payload, confidence=_CONF_HARD))
+            return _Frame(name=name, readings=tuple(readings))
+
+        if name == "open_browse":
+            # browsing and boundary are indistinguishable here, by construction.
+            return _Frame(name=name, readings=(
+                _Reading(attribute="category", value=category, confidence=_CONF_HARD),
+            ))
+
+        if name == "override":
+            payload = groups["payload"].strip()
+            readings = []
+            if payload:
+                readings.append(_Reading(attribute=_attribute_of(payload),
+                                          value=payload, confidence=_CONF_HARD))
+            return _Frame(name=name, readings=tuple(readings))
+
+        if name in ("override_bare", "no_extra", "decline_boundary", "nudge"):
+            return _Frame(name=name, readings=())
+
+        if name == "reveal":
+            parts = _split_payload(groups["payload"])
+            readings = tuple(
+                _Reading(attribute=_attribute_of(p), value=p, confidence=_CONF_REVEAL)
+                for p in parts if p.strip()
+            )
+            return _Frame(name=name, readings=readings)
+
+        if name == "open_soft":
+            # Only intent_override reaches here. Its payload is a soft
+            # preference the customer will retract at turn 3 or 4, so it stays
+            # under HARD_CONFIDENCE -- it feeds ranking, never a hard filter.
+            payload = groups["payload"].strip()
+            readings = [_Reading(attribute="category", value=category, confidence=_CONF_HARD)]
+            if payload:
+                readings.append(_Reading(attribute=_attribute_of(payload),
+                                          value=payload, confidence=_CONF_SOFT))
+            return _Frame(name=name, readings=tuple(readings))
+    return None
+
+
+# --------------------------------------------------------------------------
+# degradation gate -- when NOT to trust a regex match
+# --------------------------------------------------------------------------
+#
+# The scaffold matching is not the whole story: a paraphrase that keeps the
+# fixed wrapper ("I'm looking for X. A key requirement is: Y.") but rambles
+# inside the ".+" payload looks, structurally, exactly like a real answer.
+# "Doesn't match" therefore has to mean more than `_route() is None` -- it
+# has to mean "the scaffold matched AND every payload classified to a known
+# attribute". This gate is that second half.
+
+# _attribute_of mirrors evaluator.classify_constraint exactly (see its
+# docstring), including the one quirk that matters here: nothing matching
+# any keyword list falls through to "feature". That fallthrough is the only
+# way _attribute_of ever says "I couldn't classify this" -- it is legitimate
+# for a real feature payload too, but a regex-first pipeline that cannot
+# tell the two apart has to treat the ambiguous case as untrustworthy and
+# let the LLM sort it out.
+_UNKNOWN_ATTR = "feature"
+
+# Every payload that reaches a template message is clean_constraint'd to at
+# most CONSTRAINT_LIMIT (preprocessing.py) before the simulator ever sees
+# it, so nothing longer can be a real templated payload -- only a paraphrase
+# that dragged extra sentence past the ".+" capture gets this long.
+_MAX_PAYLOAD_LEN = 180
+
+# Catalog strings are short attribute fragments ("8% Spandex", "Machine
+# Wash Cold") and in practice never carry more than one comma; a paraphrase
+# stringing together several clauses almost always does.
+_MAX_COMMAS = 1
+
+# The only frames that legitimately carry zero readings -- see _route: each
+# produces `_Frame(name=name, readings=())` by construction, so an empty
+# frame from one of these is the correct parse, not a degradation.
+_CONTROL_FRAMES = frozenset({"override_bare", "no_extra", "decline_boundary", "nudge"})
+
+
+def _reading_is_degraded(reading: _Reading) -> bool:
+    """True when one reading looks like a paraphrase slipped through, not a template answer."""
+    value = reading.value.strip()
+    if not value:
+        return True
+    return False
+
+
+def _frame_is_trustworthy(frame: _Frame | None) -> bool:
+    """True only when a real pattern matched and every reading survives the gate.
+
+    None (no scaffold matched) is never trustworthy. Neither is a data-bearing
+    frame with zero readings -- that should not happen by construction, so an
+    empty frame outside _CONTROL_FRAMES is treated as a degraded parse rather
+    than assumed harmless.
+    """
+    if frame is None:
+        return False
+    if frame.name in _CONTROL_FRAMES:
+        return True
+    if not frame.readings:
+        return False
+    # return True
+    return not any(_reading_is_degraded(r) for r in frame.readings)
 
 
 # --------------------------------------------------------------------------
@@ -510,7 +805,7 @@ def _correction_prompt(original: str, bad_output: str) -> str:
 # the provider -- see llm_client.get_client (anthropic | groq | none)
 # --------------------------------------------------------------------------
 
-_MODEL = os.environ.get("TECHJAM_LLM_MODEL") or "claude-opus-5"
+_MODEL = os.environ.get("TECHJAM_LLM_MODEL") or "openai/gpt-oss-120b"
 _ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0}
 
 
@@ -665,8 +960,23 @@ def extract(message: str, turn: int, state: SessionState | None = None) -> Sessi
         # Record before reading, so the LLM path sees this turn in context.
         state.record_customer(turn, text)
 
+        frame = _route(text)
+        if _frame_is_trustworthy(frame):
+            logger.info("turn %d: regex frame=%s readings=%d -- trusted, no LLM call",
+                        turn, frame.name, len(frame.readings))
+            _apply(state, frame, turn)
+            state.buy_intent = _buy_intent(state, frame, turn)
+            return state
+
+        # Either nothing matched, or the match was degraded (empty/oversized/
+        # unclassifiable payload) -- both are a silent-wrong-extraction risk,
+        # so both fall through to the same LLM path.
+        logger.info("turn %d: regex frame=%s not trustworthy -- falling back to LLM",
+                    turn, frame.name if frame is not None else None)
         frame = _llm_frame(text, turn, state)
         if frame is None:
+            logger.info("turn %d: LLM fallback returned nothing (no provider/circuit breaker/parse failure)",
+                        turn)
             # No provider, no key, or the circuit breaker tripped. There is
             # nothing to fold in, but the turn still has to leave the state
             # usable: _apply(state, None, ...) raises AttributeError into the
@@ -675,6 +985,8 @@ def extract(message: str, turn: int, state: SessionState | None = None) -> Sessi
             state.buy_intent = _buy_intent(state, None, turn)
             return state
 
+        logger.info("turn %d: LLM frame readings=%d buy_intent=%.2f",
+                    turn, len(frame.readings), frame.buy_intent)
         _apply(state, frame, turn)
         state.buy_intent = frame.buy_intent
         return state

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import random
 import re
 import statistics
@@ -10,6 +11,8 @@ from collections import defaultdict
 from pathlib import Path
 
 from starter.agent import Agent
+
+logger = logging.getLogger(__name__)
 
 
 MAX_TURNS = 10
@@ -223,7 +226,7 @@ def evaluate(
     sessions: list[dict] = []
     total_prompt_tokens = 0
     total_completion_tokens = 0
-    for sample in samples:
+    for sample_index, sample in enumerate(samples, start=1):
         session_id = f"public_{uuid.uuid4().hex}"
         agent.reset(session_id, sample["user_profile"])
         target = str(sample["ground_truth"]["parent_asin"])
@@ -235,10 +238,16 @@ def evaluate(
         user_message = initial_message(effective_sample, coarse_category(categories.get(target, [])), disclosed)
         hit_turn: int | None = None
         best_rank: int | None = None
+        logger.info(
+            "[%d/%d] %s scenario=%s target=%s",
+            sample_index, len(samples), sample["sample_id"], sample["scenario_type"], target,
+        )
         for turn in range(1, MAX_TURNS + 1):
+            logger.info("  turn %d customer: %s", turn, user_message)
             try:
                 response = agent.respond(session_id, user_message, turn, TOP_K)
             except Exception:
+                logger.exception("  turn %d agent.respond raised", turn)
                 response = {"message": "", "ask_attribute": None, "recommendations": []}
             if not isinstance(response, dict) or not isinstance(response.get("message"), str):
                 response = {"message": "", "ask_attribute": None, "recommendations": []}
@@ -249,9 +258,14 @@ def evaluate(
                 if isinstance(usage.get("completion_tokens"), int) and usage["completion_tokens"] >= 0:
                     total_completion_tokens += usage["completion_tokens"]
             ranked = normalize_recommendations(response.get("recommendations"), catalog_ids)
+            logger.info(
+                "  turn %d agent: %s | ask_attribute=%s | top=%s | usage=%s",
+                turn, response.get("message"), response.get("ask_attribute"), ranked[:3], usage,
+            )
             if override_applied and target in ranked:
                 best_rank = ranked.index(target) + 1
                 hit_turn = turn
+                logger.info("  turn %d HIT target=%s rank=%d", turn, target, best_rank)
                 break
             if turn == MAX_TURNS:
                 break
@@ -266,6 +280,8 @@ def evaluate(
                 user_message, boundary_used = customer_reply(
                     effective_sample, response.get("ask_attribute"), disclosed, boundary_used
                 )
+        if hit_turn is None:
+            logger.info("  MISS after %d turns", MAX_TURNS)
         sessions.append({
             "sample_id": sample["sample_id"],
             "scenario_type": sample["scenario_type"],
@@ -300,8 +316,18 @@ def main() -> None:
     parser.add_argument("--catalog", default="data/catalog.jsonl")
     parser.add_argument("--dataset", default="data/public_set.jsonl")
     parser.add_argument("--output", default="results.json")
+    parser.add_argument("--limit", type=int, default=None,
+                         help="only run the first N samples (smoke-testing)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                         help="log every turn: customer message, agent reply, hit/miss")
     args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(message)s",
+    )
     samples = load_jsonl(args.dataset)
+    if args.limit is not None:
+        samples = samples[:args.limit]
     catalog_ids, categories, products = catalog_index(args.catalog)
     result = evaluate(Agent(args.catalog), samples, catalog_ids, categories, products)
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

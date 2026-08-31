@@ -97,7 +97,7 @@ def build_request(prep: Preprocessing, state: SessionState, pool: list[str]) -> 
     }
 
 
-def rerank(prep: Preprocessing, state: SessionState, pool: list[str], top_k: int) -> list[str]:
+def rerank(prep: Preprocessing, state: SessionState, pool: list[str], top_k: int, is_llm_rerank: bool) -> list[str]:
     """Order `pool` best-first and return at most `top_k` parent_asins."""
     if not pool or top_k <= 0:
         return []
@@ -105,7 +105,7 @@ def rerank(prep: Preprocessing, state: SessionState, pool: list[str], top_k: int
     request = build_request(prep, state, pool)
     shrunk = shrink_pool(request)
 
-    if not _use_llm():
+    if not is_llm_rerank:
         return [row["parent_asin"] for row in shrunk["products"][:top_k]]
 
     result = llm_rerank(request, shrunk, top_k=top_k)
