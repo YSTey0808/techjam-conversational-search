@@ -17,6 +17,7 @@ off even with a key.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 
 from reranker.reranker import CONFIG, llm_rerank, load_env, shrink_pool
@@ -36,29 +37,32 @@ def _use_llm() -> bool:
 
 
 def _constraint_rows(prep: Preprocessing, state: SessionState) -> list[tuple[dict, set[str]]]:
-    """(request constraint, posting set) for every resolved constraint.
+    """(request constraint, posting set) for every resolved slot.
 
-    Unresolved constraints (empty `key`) are skipped for the same reason
+    Unresolved slots (empty `key`) are skipped for the same reason
     retrieve._intersect skips them: a string we cannot find in the catalog is our
     indexing failure, not evidence against a product. Including them would leave
     every candidate "unknown" and silently disable the safety rule.
 
-    Attributes are suffixed with their index because two constraints often share
-    one attribute ("feature"), and constraint_status is keyed by attribute.
+    Attributes keep their positional suffix. It is redundant now that slots are
+    keyed by attribute, but constraint_status must stay unique per entry for
+    reranker._is_guaranteed, and the suffix is what guarantees that whatever the
+    slot map does next.
 
     Posting sets are looked up once per turn here, not once per candidate.
     """
     return [
-        ({"attribute": f"{c.attribute}:{i}", "value": c.text}, prep.lookup(c.key, broad=True))
-        for i, c in enumerate(state.constraints)
-        if c.key
+        ({"attribute": f"{attribute}:{i}", "value": str(slot.val)},
+         prep.lookup(slot.key, broad=True))
+        for i, (attribute, slot) in enumerate(state.filled_slots.items())
+        if slot.key
     ]
 
 
 def _query(state: SessionState) -> str:
     """The customer's ask, reassembled - SessionState keeps no raw utterance."""
     parts = [state.category or ""]
-    parts += [c.text for c in state.constraints if c.text]
+    parts += [str(slot.val) for slot in state.filled_slots.values() if slot.val]
     return "; ".join(part for part in parts if part)
 
 
@@ -68,7 +72,11 @@ def build_request(prep: Preprocessing, state: SessionState, pool: list[str]) -> 
     return {
         "query": _query(state),
         "constraints": [entry for entry, _postings in rows],
-        "user_profile": state.profile or None,
+        # reranker.py reads this with .get() (reranker.py:98, :106), but
+        # user_profile is a UserProfile dataclass since the schema migration.
+        # asdict() is the boundary conversion; a bare dataclass would silently
+        # disable the preference and rating-style judges.
+        "user_profile": dataclasses.asdict(state.user_profile) if state.user_profile else None,
         "pool": [
             {
                 "parent_asin": asin,

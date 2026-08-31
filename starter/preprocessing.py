@@ -17,12 +17,14 @@ Public surface used by the five modules:
     prep.title[asin]             -> str
     prep.text[asin]              -> str                searchable text, truncated
     prep.average_rating[asin]    -> float | None       stars, not the count
+    prep.product_slots[asin]     -> dict[str, list[str]]   normalised slot table
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from bisect import bisect_left
 from collections import defaultdict
@@ -155,6 +157,84 @@ def constraint_candidates(product: dict) -> list[str]:
     return cleaned
 
 
+# --- the normalised slot table ---------------------------------------------
+# A second, pre-extracted view of the same 50,000 products:
+# data/catalog_normalised.jsonl, one row per parent_asin, every attribute
+# already reduced to a small controlled vocabulary. ask.py needs it to measure
+# how well an attribute splits a candidate pool -- raw features/details cannot
+# answer "how many distinct colours are in this pool?".
+#
+# scripts/build_inverted_index.py reads the same file through the same
+# functions, so the ask policy and the inverted index can never end up on
+# different vocabularies.
+
+SLOT_PATH = "data/catalog_normalised.jsonl"
+
+# Every attribute column in the file. `price` is deliberately absent: it is a
+# number, not a slot value, and nothing here buckets it.
+SLOT_FIELDS = ("category", "audience", "brand", "material", "color",
+               "feature", "style", "use_case", "region")
+
+# "unknown" is a real string in the file, not an absence marker we invented --
+# it is the value on 33,346 of the 50,000 `region` cells. Treating it as a
+# value would make "region" look like a well-populated, high-entropy attribute.
+MISSING_SLOT_VALUES = {"", "unknown", "null", "none", "n/a", "na"}
+
+
+def normalize_slot_value(value: object) -> str:
+    """One slot cell -> its comparison form, or "" if it says nothing."""
+    if value is None or isinstance(value, bool):
+        return ""
+    text = _WS_RE.sub(" ", str(value)).strip().lower()
+    return "" if text in MISSING_SLOT_VALUES else text
+
+
+def row_slots(row: dict) -> dict[str, list[str]]:
+    """One normalised catalog row -> {field: [values]}, empty fields dropped.
+
+    Scalar and list columns are handled the same way, so a schema change that
+    turns `brand` into a list costs nothing here.
+    """
+    slots: dict[str, list[str]] = {}
+    for field in SLOT_FIELDS:
+        raw = row.get(field)
+        items = raw if isinstance(raw, (list, tuple)) else [raw]
+        values: list[str] = []
+        for item in items:
+            text = normalize_slot_value(item)
+            if text and text not in values:
+                values.append(text)
+        if values:
+            slots[field] = values
+    return slots
+
+
+def load_product_slots(path: str | Path) -> dict[str, dict[str, list[str]]]:
+    """The slot table keyed by parent_asin. NEVER raises.
+
+    A missing file returns {}, and ask._slot_values already treats that as "no
+    data": every split score is 0.0 and the agent falls back to asking "other".
+    Degrading is the whole point -- this file is not in the release bundle, and
+    an agent that cannot be constructed scores zero on every session.
+    """
+    table: dict[str, dict[str, list[str]]] = {}
+    try:
+        handle = Path(path).open(encoding="utf-8")
+    except OSError:
+        return table
+    with handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                asin = str(row["parent_asin"])
+            except (ValueError, KeyError, TypeError):
+                continue        # one malformed row must not cost the other 49,999
+            table[asin] = row_slots(row)
+    return table
+
+
 # --- attribute classification ---------------------------------------------
 # Used by ask.py to work out which attribute best splits a pool. Ours, not
 # borrowed: it only has to be self-consistent with our own index.
@@ -198,6 +278,7 @@ class Preprocessing:
         self.text: dict[str, str] = {}
         self.coarse: dict[str, str] = {}
         self.product_keys: dict[str, tuple[str, ...]] = {}
+        self.product_slots: dict[str, dict[str, list[str]]] = {}
         self.postings: dict[str, set[str]] = {}
         self.canon_postings: dict[str, set[str]] = {}
         self.cat_index: dict[str, set[str]] = {}
@@ -289,10 +370,18 @@ def active() -> Preprocessing | None:
     return _ACTIVE
 
 
-def build(catalog_path: str | Path) -> Preprocessing:
-    """Load and index the catalog. Call once."""
+def build(catalog_path: str | Path, slots_path: str | Path | None = None) -> Preprocessing:
+    """Load and index the catalog. Call once.
+
+    `slots_path` defaults to TECHJAM_SLOTS, then to data/catalog_normalised.jsonl
+    -- the same override shape retrieve.py uses for TECHJAM_CATALOG. A missing
+    slot file is not an error; see load_product_slots.
+    """
     global _ACTIVE
     prep = Preprocessing()
+    if slots_path is None:
+        slots_path = os.environ.get("TECHJAM_SLOTS", SLOT_PATH)
+    prep.product_slots = load_product_slots(slots_path)
     postings: dict[str, set[str]] = defaultdict(set)
     canon: dict[str, set[str]] = defaultdict(set)
     cat_index: dict[str, set[str]] = defaultdict(set)

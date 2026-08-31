@@ -87,19 +87,19 @@ _FALLBACK_LIMIT = 200
 
 def _intersect(
     prep: Preprocessing,
-    constraints: list[Constraint],
+    slots: list[Slot],
     seed: set[str] | None,
     broad: bool,
 ) -> set[str] | None:
     """Intersect posting lists into `seed`. None means it collapsed to empty.
 
-    An unmatched constraint is SKIPPED, never intersected: a string we cannot
-    find is our indexing failure, not evidence the product does not exist.
+    An unmatched slot is SKIPPED, never intersected: a string we cannot find is
+    our indexing failure, not evidence the product does not exist.
     Intersecting on an empty posting list would destroy the pool.
     """
     pool = None if seed is None else set(seed)
-    for constraint in constraints:
-        postings = prep.lookup(constraint.key, broad=broad)
+    for slot in slots:
+        postings = prep.lookup(slot.key, broad=broad)
         if not postings:
             continue
         pool = set(postings) if pool is None else (pool & postings)
@@ -109,13 +109,18 @@ def _intersect(
 
 
 def _score_matches(prep: Preprocessing, state: SessionState, pool: set[str]) -> dict[str, float]:
-    """Summed IDF of every constraint each candidate actually matches."""
+    """Summed IDF of every slot each candidate actually matches.
+
+    `confidence_score` carries the weight the old `Constraint.weight` did: it is
+    already 0..1 and already says how firmly the customer wants this, so a
+    separate hard/soft weight would just be a coarser copy of it.
+    """
     scores = {asin: 0.0 for asin in pool}
-    for constraint in state.constraints:
-        if not constraint.key:
+    for slot in state.filled_slots.values():
+        if not slot.key:
             continue
-        weight = constraint.weight * prep.idf(constraint.key)
-        matched = prep.lookup(constraint.key, broad=True)
+        weight = (slot.confidence_score or 0.0) * prep.idf(slot.key)
+        matched = prep.lookup(slot.key, broad=True)
         for asin in pool:
             if asin in matched:
                 scores[asin] += weight
@@ -134,10 +139,10 @@ def _keyword(prep: Preprocessing, state: SessionState) -> dict[str, float]:
       3. drop the category gate LAST -- it is the cheapest evidence to lose
          only because it is also the least likely to be wrong
     """
-    hard = [c for c in state.constraints if c.hard and c.key]
+    hard = [s for s in state.hard_slots.values() if s.key]
     if not hard:
         return {}
-    ordered = sorted(hard, key=lambda c: prep.idf(c.key), reverse=True)
+    ordered = sorted(hard, key=lambda s: prep.idf(s.key), reverse=True)
     category_pool = prep.category_pool(state.category)
 
     for use_category in (True, False):
@@ -251,12 +256,17 @@ def _slots_from(state: SessionState):
     from multi_retrieval import Slots
 
     slots = Slots(category=state.category or "")
-    for constraint in state.constraints:
-        name = _ATTRIBUTE_TO_SLOT.get(constraint.attribute)
+    for attribute, slot in state.filled_slots.items():
+        # `category` is unmapped and so lands in free_text, as it did before:
+        # Slots.category feeds the category route, free_text feeds the keyword
+        # route, and both want those words.
+        name = _ATTRIBUTE_TO_SLOT.get(attribute)
         if name and not getattr(slots, name):
-            setattr(slots, name, constraint.text)
-        elif constraint.text not in slots.free_text:
-            slots.free_text.append(constraint.text)
+            setattr(slots, name, str(slot.val))
+        elif isinstance(slot.val, str) and slot.val not in slots.free_text:
+            # Only text reaches free_text. `budget` binds a float, and "31.5"
+            # in the BM25 expression is noise, not a term.
+            slots.free_text.append(slot.val)
     return slots
 
 

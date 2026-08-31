@@ -25,7 +25,7 @@ from __future__ import annotations
 import math
 
 from starter.preprocessing import Preprocessing
-from starter.schema import TurnPolicy
+from starter.schema import REACHABLE_ATTRIBUTES, SessionState, TurnPolicy
 
 # ask.py owns list width. The harness convention is a top-10 list; if that ever
 # changes, change it here -- it is the only place that decides how many
@@ -35,19 +35,27 @@ _LIST_WIDTH = 10
 # Below this, no attribute splits the pool usefully, so we say nothing and let
 # the customer lead rather than burning a turn on a useless question.
 _MIN_SPLIT = 0.05
-_ASK_ATTRIBUTES = (
-    "category",
-    "material",
-    "color",
-    "size",
-    "brand",
-    "budget",
-    "style",
-    "feature",
-    "use_case",
-    "other",
-)
-# catalog_normalised.xlsx also has audience and region; ignore them for ask
+
+# The fallback question when no attribute splits the pool. See decide().
+_OTHER_ATTRIBUTE = "other"
+
+# The shared team config the module docstring asks for, rather than a local
+# copy: schema.REACHABLE_ATTRIBUTES = material, color, style, use_case, budget,
+# feature.
+#
+# "category" and "brand" are deliberately NOT here even though the slot table
+# covers both (100% and 99.4%). They would win on split quality every turn --
+# brand has 19,745 distinct values, so its normalized entropy is near maximal --
+# and evaluator.classify_constraint can never return either label, so the
+# customer replies "I don't have an additional preference for brand" every
+# time. A question that cannot be answered is a spent turn.
+#
+# "size" and "other" have no column in catalog_normalised.jsonl, so they score
+# 0.0 and could never be picked anyway. "other" still reaches the customer, via
+# the no-split fallback in decide().
+_ASK_ATTRIBUTES = REACHABLE_ATTRIBUTES
+
+# catalog_normalised.jsonl also has audience and region; ignore them for ask
 # selection because they are not API ask_attributes.
 # API ask_attribute is "other"; the extracted catalog/session slot is "others".
 _STATE_SLOT_NAME = {"other": "others"}
@@ -72,34 +80,28 @@ def _slot_name(attribute: str) -> str:
     return _STATE_SLOT_NAME.get(attribute, attribute)
 
 
-def _known_attributes(state: dict) -> set[str]:
+def _known_attributes(state: SessionState) -> set[str]:
     """Attributes already filled by query/reply extraction."""
     known = set()
-    slots = state.get("slots", {})
-    if not isinstance(slots, dict):
-        return known
-
     for attribute in _ASK_ATTRIBUTES:
-        slot = slots.get(_slot_name(attribute), {})
-        if not isinstance(slot, dict):
-            continue
-        value = slot.get("val")
-        if value not in (None, "", []):
+        slot = state.slots.get(_slot_name(attribute))
+        # Slot.filled is exactly the "has the customer told us something" test
+        # this used to hand-roll against the old dict shape.
+        if slot is not None and slot.filled:
             known.add(attribute)
     return known
 
 
-def _asked_attributes(state: dict) -> set[str]:
-    """Attributes already asked in this intent context."""
-    clarification = state.get("clarification", {})
-    if not isinstance(clarification, dict):
-        return set()
+def _asked_attributes(state: SessionState) -> set[str]:
+    """Attributes already asked, plus the ones the customer has ruled out.
 
-    asked = clarification.get("asked_attributes", [])
-    return {str(value) for value in asked} if isinstance(asked, list) else set()
+    Both are permanent: re-asking something already answered, or something the
+    customer said they have no preference on, buys nothing and costs a turn.
+    """
+    return set(state.asked) | set(state.dead_attributes)
 
 
-def _candidates(state: dict) -> list[str]:
+def _candidates(state: SessionState) -> list[str]:
     """Attributes still worth asking about."""
     asked = _asked_attributes(state)
     known = _known_attributes(state)
@@ -203,7 +205,7 @@ def _message(attribute: str | None) -> str:
     return _QUESTIONS.get(attribute, _DEFAULT_MESSAGE)
 
 
-def decide(prep: Preprocessing, state: dict, pool: list[str], turn: int) -> TurnPolicy:
+def decide(prep: Preprocessing, state: SessionState, pool: list[str], turn: int) -> TurnPolicy:
     """Pick this turn's question and list width."""
     if turn >= 10:
         return TurnPolicy(
@@ -220,6 +222,21 @@ def decide(prep: Preprocessing, state: dict, pool: list[str], turn: int) -> Turn
             score = _split_quality(prep, pool, attribute)
             if score > best_score:
                 best, best_score = attribute, score
+
+    if best is not None:
+        # Without this the same attribute wins every turn: _candidates() reads
+        # state.asked, and nothing else in the pipeline writes it.
+        state.note_asked(best)
+    else:
+        # Nothing splits the pool. Saying nothing is not neutral -- the
+        # simulator answers ask_attribute=None with "Ask me about one specific
+        # attribute", which discloses nothing at all. "other" is answerable:
+        # it skips the attribute classifier and returns the next two
+        # undisclosed requirements verbatim, whatever type they are.
+        #
+        # Deliberately NOT noted as asked. An intent card holds four
+        # requirements and each "other" drains two, so the second one still pays.
+        best = _OTHER_ATTRIBUTE
 
     return TurnPolicy(
         ask_attribute=best,

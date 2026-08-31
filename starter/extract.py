@@ -671,6 +671,14 @@ def extract(message: str, turn: int, state: SessionState | None = None) -> Sessi
         state.record_customer(turn, text)
 
         frame = _llm_frame(text, turn, state)
+        if frame is None:
+            # No provider, no key, or the circuit breaker tripped. There is
+            # nothing to fold in, but the turn still has to leave the state
+            # usable: _apply(state, None, ...) raises AttributeError into the
+            # handler below, which loses buy_intent as well as the reading.
+            # _buy_intent scores the mode from evidence already held.
+            state.buy_intent = _buy_intent(state, None, turn)
+            return state
 
         _apply(state, frame, turn)
         state.buy_intent = frame.buy_intent
