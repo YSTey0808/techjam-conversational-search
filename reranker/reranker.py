@@ -1,8 +1,8 @@
 """Stage B candidate shrinking + Stage C LLM rerank.
 
-Self-contained: no imports from the rest of the repo, no dataset paths.
-`shrink_pool` is pure stdlib and never touches the network.
-`llm_rerank` lazy-imports `anthropic` so Stage B works without it installed.
+No dataset paths. `shrink_pool` is pure stdlib and never touches the network.
+`llm_rerank` lazy-imports `llm_client` (which itself lazy-imports the provider
+SDK), so Stage B keeps working with no key and no SDK installed.
 """
 
 import json
@@ -21,10 +21,11 @@ CONFIG = {
     "w_rating_critical": 0.5,    # w_r when rating_style contains "critical"
     "w_rating_default": 0.3,     # w_r otherwise
     # --- Stage C (LLM) ---
-    # >>> MOCK MODE IS ON <<<  No API call, no tokens, no cost. The mock returns
-    # the Stage B order unchanged, so what you measure is Stage B alone. Set this
-    # to False (and provide a key) to make the real Claude call live again.
-    "llm_mock": True,
+    # Set True to force the Stage B order and skip the LLM entirely (no call, no
+    # tokens, no cost) regardless of any key. With it False, llm_rerank uses
+    # whatever llm_client.get_client() resolves (anthropic | groq) and falls back
+    # to Stage B when nothing is configured.
+    "llm_mock": False,
     "llm_model": "claude-sonnet-5",
     "llm_max_tokens": 16000,
     "llm_effort": "high",        # low | medium | high | xhigh | max
@@ -273,19 +274,30 @@ def _apply_ranking(ranking, shrunk, top_k=None):
 
 
 def llm_rerank(request, shrunk, client=None, top_k=None):
-    """Ask Claude to order the shrunk candidates. Falls back to Stage B order on any failure.
+    """Ask the configured LLM to order the shrunk candidates.
 
-    `top_k` overrides CONFIG["llm_top_k"] for this call, so a caller whose list
-    width varies per turn does not have to mutate the module-level CONFIG.
+    Falls back to Stage B order on any failure, when CONFIG["llm_mock"] is set,
+    or when no provider is configured. `top_k` overrides CONFIG["llm_top_k"] for
+    this call, so a caller whose list width varies per turn does not have to
+    mutate the module-level CONFIG.
     """
     top_k = CONFIG["llm_top_k"] if top_k is None else top_k
-    try:
-        import anthropic
-    except ImportError:
-        return _fallback(shrunk, "anthropic package not installed", top_k)
 
+    if CONFIG["llm_mock"]:
+        return _fallback(shrunk, "mock mode", top_k)
     if not shrunk["products"]:
         return _fallback(shrunk, None, top_k)
+
+    if client is None:
+        try:
+            from llm_client import get_client
+        except ImportError:
+            return _fallback(shrunk, "llm_client unavailable", top_k)
+        client = get_client(
+            model=CONFIG["llm_model"], timeout=CONFIG["llm_timeout_s"]
+        )
+    if client is None:
+        return _fallback(shrunk, "no llm provider configured", top_k)
 
     user_content = json.dumps(
         {
@@ -298,52 +310,28 @@ def llm_rerank(request, shrunk, client=None, top_k=None):
         ensure_ascii=False,
     )
 
-    output_config = {
-        "effort": CONFIG["llm_effort"],
-        "format": {"type": "json_schema", "schema": RANKING_SCHEMA},
-    }
-    kwargs = {
-        "model": CONFIG["llm_model"],
-        "max_tokens": CONFIG["llm_max_tokens"],
-        "system": SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": user_content}],
-        "output_config": output_config,
-    }
-    if CONFIG["llm_thinking"]:
-        kwargs["thinking"] = {"type": "adaptive"}
+    from llm_client import LLMError
 
-    # .env is read once here so callers do not have to; a real environment
-    # variable always wins. Zero-arg client then resolves ANTHROPIC_API_KEY /
-    # ANTHROPIC_AUTH_TOKEN / an `ant auth login` profile.
-    load_env()
-    client = client or anthropic.Anthropic()
     try:
-        response = client.with_options(
-            timeout=CONFIG["llm_timeout_s"], max_retries=CONFIG["llm_max_retries"]
-        ).messages.create(**kwargs)
-    except anthropic.BadRequestError as e:
-        return _fallback(shrunk, f"bad request: {e.message}", top_k)
-    except anthropic.AuthenticationError:
-        return _fallback(shrunk, "authentication failed - check ANTHROPIC_API_KEY", top_k)
-    except anthropic.RateLimitError:
-        return _fallback(shrunk, "rate limited", top_k)
-    except anthropic.APIStatusError as e:
-        return _fallback(shrunk, f"api error {e.status_code}", top_k)
-    except anthropic.APIConnectionError:
-        return _fallback(shrunk, "connection error", top_k)
+        result = client.complete(
+            system=SYSTEM_PROMPT,
+            user=user_content,
+            max_tokens=CONFIG["llm_max_tokens"],
+            json_schema=RANKING_SCHEMA,
+            effort=CONFIG["llm_effort"],
+            thinking=CONFIG["llm_thinking"],
+        )
+    except LLMError as error:
+        return _fallback(shrunk, str(error), top_k)
 
-    if response.stop_reason == "refusal":
-        return _fallback(shrunk, "model refused", top_k)
-
-    text = next((b.text for b in response.content if b.type == "text"), None)
     try:
-        ranking = json.loads(text)["ranking"]
+        ranking = json.loads(result.text)["ranking"]
     except (TypeError, ValueError, KeyError):
         return _fallback(shrunk, "unparseable response", top_k)
 
     return {
         "products": _apply_ranking(ranking, shrunk, top_k),
-        "model": response.model,
+        "model": result.model or CONFIG["llm_model"],
         "llm_used": True,
         "error": None,
     }

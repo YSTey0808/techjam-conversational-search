@@ -507,33 +507,24 @@ def _correction_prompt(original: str, bad_output: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# the provider -- Anthropic only
+# the provider -- see llm_client.get_client (anthropic | groq | none)
 # --------------------------------------------------------------------------
 
-_MODEL = os.environ.get("TECHJAM_LLM_MODEL", "claude-opus-5")
+_MODEL = os.environ.get("TECHJAM_LLM_MODEL") or "claude-opus-5"
 _ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0}
 
 
 @lru_cache(maxsize=1)
 def _client():
-    """The Anthropic client, or None when unavailable.
+    """The configured LLM client, or None when nothing is set up.
 
-    Returns None rather than raising for a missing package or missing key, so
-    an unconfigured checkout runs the deterministic path instead of dying
-    inside Agent.__init__ and scoring every session zero.
+    Returns None rather than raising for a missing provider, so an unconfigured
+    checkout runs the deterministic path instead of dying inside Agent.__init__
+    and scoring every session zero.
     """
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return None
-    try:
-        import anthropic          # LAZY: optional dependency, keep it that way
-    except ImportError:
-        return None
-    try:
-        # max_retries=0 because the evaluator has no timeout of its own: wall
-        # clock per turn must stay bounded by _TIMEOUT alone.
-        return anthropic.Anthropic(timeout=_TIMEOUT, max_retries=0)
-    except Exception:
-        return None
+    from llm_client import get_client   # LAZY: keeps the optional deps optional
+
+    return get_client(model=_MODEL, timeout=_TIMEOUT)
 
 
 _failures = 0
@@ -563,35 +554,39 @@ def _llm_frame(message: str, turn: int, state: SessionState) -> _Frame | None:
     prompt = _user_prompt(message, turn, state)
     spent = dict(_ZERO_USAGE)
     reading = None
+    answered = False        # did the provider ever hand back a reply to parse?
+
+    from llm_client import LLMError
 
     for _ in range(_MAX_ATTEMPTS):
         try:
-            response = client.messages.create(
-                model=_MODEL,
-                max_tokens=1024,
+            result = client.complete(
                 system=_SYSTEM,
-                messages=[{"role": "user", "content": prompt}],
-                output_config={"effort": "low"},
+                user=prompt,
+                max_tokens=1024,
+                effort="low",
             )
-        except Exception:
+        except LLMError:
             continue        # transport failure: nothing to correct, just retry
 
+        answered = True
         # Every attempt costs tokens whether or not it parsed, so usage
         # accumulates across the loop. Overwriting would under-report.
-        usage = getattr(response, "usage", None)
-        spent["prompt_tokens"] += max(0, int(getattr(usage, "input_tokens", 0) or 0))
-        spent["completion_tokens"] += max(0, int(getattr(usage, "output_tokens", 0) or 0))
+        spent["prompt_tokens"] += max(0, int(result.usage.get("prompt_tokens", 0)))
+        spent["completion_tokens"] += max(0, int(result.usage.get("completion_tokens", 0)))
 
-        raw = "".join(block.text for block in response.content
-                      if getattr(block, "type", "") == "text")
-        reading = _parse_reading(raw)
+        reading = _parse_reading(result.text)
         if reading is not None:
             break
-        prompt = _correction_prompt(_user_prompt(message, turn, state), raw)
+        prompt = _correction_prompt(_user_prompt(message, turn, state), result.text)
 
     state.usage = spent
     if reading is None:
-        _failures += 1
+        # Only a reply we could not use counts against the breaker. A pure
+        # transport failure (rate limit, timeout) says nothing about whether
+        # the model can do this, and must not disable extraction for the run.
+        if answered:
+            _failures += 1
         return None
     _failures = 0
 

@@ -6,13 +6,10 @@ Same signature and same contract as the rank.rank() it replaces, so agent.py
 changes by one line. Everything pipeline-shaped lives here; reranker.py stays
 self-contained and knows nothing about Preprocessing or SessionState.
 
-CONFIG["llm_mock"] is currently True, so the LLM step is an identity function:
-the turn's ordering is Stage B's, with no API call and no cost.
-
-Once the mock is off, the LLM step runs only when a credential is visible
-(ANTHROPIC_API_KEY, from the environment or .env). With no key the turn is pure
-Stage B - no network, no per-turn latency. Set RERANKER_USE_LLM=0 to force it
-off even with a key.
+The Stage C LLM step runs only when a provider is configured -- see
+llm_client.get_client (ANTHROPIC_API_KEY or GROQ_API_KEY, from the environment
+or .env). With none the turn is pure Stage B: no network, no per-turn latency.
+CONFIG["llm_mock"]=True or RERANKER_USE_LLM=0 forces Stage B even with a key.
 """
 
 from __future__ import annotations
@@ -29,11 +26,16 @@ def _use_llm() -> bool:
     load_env()
     if os.environ.get("RERANKER_USE_LLM", "1").strip().lower() in {"0", "false", "no"}:
         return False
-    # Mock mode needs no credential: llm_rerank short-circuits to the Stage B
-    # order before touching the network, so the path runs at zero cost.
     if CONFIG["llm_mock"]:
+        return False
+    provider = (os.environ.get("TECHJAM_LLM_PROVIDER") or "").strip().lower()
+    if provider in {"anthropic", "groq"}:
         return True
-    return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+    return bool(
+        os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        or os.environ.get("GROQ_API_KEY")
+    )
 
 
 def _constraint_rows(prep: Preprocessing, state: SessionState) -> list[tuple[dict, set[str]]]:
