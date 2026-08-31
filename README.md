@@ -254,8 +254,11 @@ same 50,000 products takes 1.6 s. Neither is ever rebuilt per turn.
 Useful variations:
 
 ```bash
-python3 -m evaluator.local_evaluator --limit 20        # smoke test, ~7s
-python3 -m evaluator.local_evaluator -v                # log every turn: message, reply, hit/miss
+# explicit paths, when running against a different catalog or dataset
+python3 -m evaluator.local_evaluator --catalog data/catalog.jsonl \
+                                     --dataset data/public_set.jsonl \
+                                     --output results.json
+
 python3 -m scripts.run_local_evaluator --config myrun  # same run + a compact report under evaluation_reports/
 python3 -m unittest discover tests                     # 119 tests, ~0.1s
 ```
