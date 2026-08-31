@@ -227,6 +227,29 @@ class SessionState:
         if target is not None and target.filled:
             target.confidence_score = (target.confidence_score or 0.0) * factor
 
+    def forget(self, attribute: str) -> None:
+        """Fully clear a slot's value, and let ask.py ask about it again.
+
+        Used when a dependency-graph cascade invalidates the attribute because
+        its parent changed (e.g. category flips, so the old size no longer
+        applies). Unlike `demote`, this removes the value outright rather than
+        just discounting it -- the old value isn't uncertain, it's wrong.
+        Removing it from `asked` matters just as much: if we don't, ask.py
+        thinks it already has an answer and never asks again.
+
+        `excluded` (values ruled OUT) is left alone -- that fact does not
+        depend on which value we currently hold.
+        """
+        target = self.slots.get(attribute)
+        if target is not None:
+            target.val = ""
+            target.confidence_score = 0.0
+            target.key = ""
+            target.keys = []
+            target.turn = 0
+        if attribute in self.asked:
+            self.asked.remove(attribute)
+
     def mark_dead(self, attribute: str) -> None:
         """The customer has no preference here. Never ask again."""
         if attribute:

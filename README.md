@@ -43,6 +43,40 @@ python3 -m evaluator.local_evaluator
 Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
 The command writes per-session results and aggregate metrics to `results.json`.
 
+For local optimisation tracking, use the wrapper command. It calls the default
+evaluator, then writes compact run metrics to
+`evaluation_reports/local_<timestamp>.json`:
+
+```bash
+python3 -m scripts.run_local_evaluator
+```
+
+Add `--config <label>` when you want the report filename to include an
+experiment label, for example
+`evaluation_reports/local_a_<timestamp>.json`.
+
+## Run a Local LLM Customer Simulator
+
+For conversation debugging, set `GROQ_API_KEY` in `.env` or your shell and run:
+
+```bash
+python3 -m scripts.local_chat_simulator
+```
+
+The simulator randomly chooses five real catalog products by default, runs one
+conversation per product against `starter.Agent`, prints every turn, and saves a
+compact transcript under `chat_transcripts/`. The saved JSON includes run-level
+`hit_rate_at_10`, `mrr`, `mttc`, the same metrics grouped by scenario, plus
+per-session hit, first-hit turn, best rank, reciprocal rank, and final recommendation list.
+Without `--config`, the transcript filename is
+`chat_transcripts/chat_<timestamp>.json`. Add `--config <label>` when you want
+the filename to include an experiment label, for example
+`chat_transcripts/chat_groq-test_<timestamp>.json`.
+
+Use `--target-asin B000...` to handpick a product. Use `--scenario buying`,
+`browsing`, `intent_override`, or `boundary` to force one scenario; the default
+`--scenario mixed` samples from the competition-style mix.
+
 The included weak BM25 starter scores Hit Rate@10 `0.125`, MRR `0.068034`, and
 MTTC `9.81` on the released public set. See `docs/baseline_results.json`.
 

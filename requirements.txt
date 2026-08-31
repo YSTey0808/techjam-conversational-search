@@ -1,0 +1,12 @@
+# Required. starter/extract.py validates LLM output through pydantic models.
+pydantic>=2.13
+
+# Loads .env so ANTHROPIC_API_KEY doesn't need to be exported by hand.
+python-dotenv>=1.0
+
+# The LLM path goes through llm_client.get_client (anthropic | groq). Both
+# imports are lazy, so the agent still runs (with no model calls) when neither
+# a provider SDK nor an API key is present.
+#   - Groq (TECHJAM_LLM_PROVIDER=groq): needs nothing here, it is raw urllib.
+#   - Anthropic (the default when ANTHROPIC_API_KEY is set): needs this.
+anthropic>=1.0

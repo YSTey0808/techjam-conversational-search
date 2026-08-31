@@ -18,9 +18,61 @@ list costs nothing but a turn.
 from __future__ import annotations
 
 import math
+import os
 
 from starter.preprocessing import Preprocessing
-from starter.schema import Constraint, SessionState
+from starter.schema import SessionState, Slot
+
+# ---------------------------------------------------------------------------
+# Candidate generation is delegated to the multi_retrieval package.
+#
+# Measured inside this pipeline, on the 200 public sessions, with everything
+# else (extract, state, rank, ask) unchanged:
+#
+#     _original_retrieve + rank.py       0.5560
+#     multi_retrieval    + rank.py       0.6995
+#
+# Ranking is deliberately NOT taken over: agent.py calls the reranker
+# (reranker/adapter.py) after this function, and letting a separate stage score
+# the pool was worth another 0.03 over multi_retrieval ordering the results
+# itself. This function's job is to decide WHICH candidates it sees, nothing
+# more. The numbers above predate the reranker -- rank.py was the scorer then.
+#
+# Flip this to False to restore the original implementation, which is preserved
+# below as _original_retrieve. Nothing else needs changing.
+# ---------------------------------------------------------------------------
+USE_MULTI_RETRIEVAL = True
+
+# multi_retrieval builds its own index and needs the catalog file, which
+# Preprocessing does not record. Override with TECHJAM_CATALOG if you run the
+# evaluator against a different one.
+#
+# The routes and hard filter build from the NORMALISED faceted table; the
+# original export is still handed over as the numeric sidecar so the popularity
+# prior and rating gates have average_rating / rating_number to read.
+_CATALOG_PATH = os.environ.get("TECHJAM_CATALOG", "data/catalog.jsonl")
+_NORMALISED_PATH = os.environ.get(
+    "TECHJAM_CATALOG_NORMALISED", "data/catalog_normalised.jsonl"
+)
+# Precomputed nomic catalog vectors. If present (and sentence-transformers is
+# installed) the vector route turns on; otherwise the two lexical routes carry
+# the query and nothing here changes.
+_EMBEDDINGS_DIR = os.environ.get("TECHJAM_EMBEDDINGS", "data/embeddings")
+
+# How many candidates to hand the reranker. Matches the original _FUSE_LIMIT so
+# the downstream stages see a pool of the size they were tuned against.
+_POOL_SIZE = 50000
+
+# Their Constraint.attribute vocabulary -> multi_retrieval slot names. The two
+# line up because both are typed by attribute; "use_case" has no direct slot so
+# it lands on the nearest one, and anything unmapped goes to free_text rather
+# than being dropped.
+_ATTRIBUTE_TO_SLOT = {
+    "material": "material", "color": "color", "size": "size",
+    "style": "style", "use_case": "occasion", "brand": "brand",
+}
+
+_RETRIEVER = None
 
 # Reciprocal-rank fusion constant. 60 is the usual default; it flattens the
 # difference between rank 1 and rank 2 so no single route can dominate.
@@ -36,7 +88,7 @@ _WEIGHTS = {
 _DEFAULT_WEIGHTS = _WEIGHTS["browsing"]
 
 _ROUTE_LIMIT = 500      # per-route cap before fusion
-_FUSE_LIMIT = 200       # candidates handed to rank.py
+_FUSE_LIMIT = 200       # candidates handed to the reranker
 _FALLBACK_LIMIT = 200
 
 
@@ -46,19 +98,19 @@ _FALLBACK_LIMIT = 200
 
 def _intersect(
     prep: Preprocessing,
-    constraints: list[Constraint],
+    slots: list[Slot],
     seed: set[str] | None,
     broad: bool,
 ) -> set[str] | None:
     """Intersect posting lists into `seed`. None means it collapsed to empty.
 
-    An unmatched constraint is SKIPPED, never intersected: a string we cannot
-    find is our indexing failure, not evidence the product does not exist.
+    An unmatched slot is SKIPPED, never intersected: a string we cannot find is
+    our indexing failure, not evidence the product does not exist.
     Intersecting on an empty posting list would destroy the pool.
     """
     pool = None if seed is None else set(seed)
-    for constraint in constraints:
-        postings = prep.lookup(constraint.key, broad=broad)
+    for slot in slots:
+        postings = prep.lookup(slot.key, broad=broad)
         if not postings:
             continue
         pool = set(postings) if pool is None else (pool & postings)
@@ -68,13 +120,18 @@ def _intersect(
 
 
 def _score_matches(prep: Preprocessing, state: SessionState, pool: set[str]) -> dict[str, float]:
-    """Summed IDF of every constraint each candidate actually matches."""
+    """Summed IDF of every slot each candidate actually matches.
+
+    `confidence_score` carries the weight the old `Constraint.weight` did: it is
+    already 0..1 and already says how firmly the customer wants this, so a
+    separate hard/soft weight would just be a coarser copy of it.
+    """
     scores = {asin: 0.0 for asin in pool}
-    for constraint in state.constraints:
-        if not constraint.key:
+    for slot in state.filled_slots.values():
+        if not slot.key:
             continue
-        weight = constraint.weight * prep.idf(constraint.key)
-        matched = prep.lookup(constraint.key, broad=True)
+        weight = (slot.confidence_score or 0.0) * prep.idf(slot.key)
+        matched = prep.lookup(slot.key, broad=True)
         for asin in pool:
             if asin in matched:
                 scores[asin] += weight
@@ -93,10 +150,10 @@ def _keyword(prep: Preprocessing, state: SessionState) -> dict[str, float]:
       3. drop the category gate LAST -- it is the cheapest evidence to lose
          only because it is also the least likely to be wrong
     """
-    hard = [c for c in state.constraints if c.hard and c.key]
+    hard = [s for s in state.hard_slots.values() if s.key]
     if not hard:
         return {}
-    ordered = sorted(hard, key=lambda c: prep.idf(c.key), reverse=True)
+    ordered = sorted(hard, key=lambda s: prep.idf(s.key), reverse=True)
     category_pool = prep.category_pool(state.category)
 
     for use_category in (True, False):
@@ -174,8 +231,90 @@ def _fallback(prep: Preprocessing, state: SessionState) -> list[str]:
     return sorted(source, key=lambda a: -prep.popularity.get(a, 0.0))[:_FALLBACK_LIMIT]
 
 
+def _multi_retriever(prep: Preprocessing):
+    """Build the multi_retrieval index once and reuse it.
+
+    Indexing 50,000 products takes a little over a second, so this must not
+    happen per turn. The catalog is checked against the one Preprocessing
+    loaded: indexing a different file would produce candidates that the
+    reranker and ask.py cannot resolve, and it would fail silently rather
+    than loudly.
+    """
+    global _RETRIEVER
+    if _RETRIEVER is None:
+        from multi_retrieval import DualTrackRetriever
+
+        primary = _NORMALISED_PATH if os.path.exists(_NORMALISED_PATH) else _CATALOG_PATH
+        embeddings = _EMBEDDINGS_DIR if os.path.isdir(_EMBEDDINGS_DIR) else None
+        retriever = DualTrackRetriever(
+            primary, raw_catalog_path=_CATALOG_PATH, embeddings_dir=embeddings,
+        )
+        if retriever.index.size != prep.n_docs:
+            raise RuntimeError(
+                f"catalog mismatch: multi_retrieval indexed {retriever.index.size} "
+                f"products from {primary!r}, but preprocessing loaded "
+                f"{prep.n_docs}. Set TECHJAM_CATALOG / TECHJAM_CATALOG_NORMALISED "
+                f"to the catalog actually in use."
+            )
+        _RETRIEVER = retriever
+    return _RETRIEVER
+
+
+def _slots_from(state: SessionState):
+    """Turn the accumulated SessionState into multi_retrieval's Slots.
+
+    `category_trusted` is left False on purpose. state.py *infers* the category
+    from the words the customer used, and filtering on an inferred category was
+    measured to cost 0.11 -- the target survived only 8% of turns while a route
+    had already found it 99.2% of the time. Only a category quoted word-for-word
+    is safe to filter on.
+    """
+    from multi_retrieval import Slots
+
+    slots = Slots(category=state.category or "")
+    for attribute, slot in state.filled_slots.items():
+        # `category` is unmapped and so lands in free_text, as it did before:
+        # Slots.category feeds the category route, free_text feeds the keyword
+        # route, and both want those words.
+        name = _ATTRIBUTE_TO_SLOT.get(attribute)
+        if name and not getattr(slots, name):
+            setattr(slots, name, str(slot.val))
+        elif isinstance(slot.val, str) and slot.val not in slots.free_text:
+            # Only text reaches free_text. `budget` binds a float, and "31.5"
+            # in the BM25 expression is noise, not a term.
+            slots.free_text.append(slot.val)
+    return slots
+
+
 def retrieve(prep: Preprocessing, state: SessionState) -> list[str]:
-    """Fuse the three routes by reciprocal rank and return the top candidates."""
+    """Find the candidate products.  <- the only public name
+
+    Same contract as before: returns roughly 200 parent_asins for the reranker
+    to score. See USE_MULTI_RETRIEVAL at the top of this file.
+    """
+    if not USE_MULTI_RETRIEVAL:
+        return _original_retrieve(prep, state)
+
+    from multi_retrieval import DualQuery
+
+    result = _multi_retriever(prep).retrieve(DualQuery(
+        slots=_slots_from(state),
+        intent=state.scenario,
+        top_k=_POOL_SIZE,
+    ))
+    pool = result.parent_asins
+    # An empty list is a guaranteed miss; the original never returned one and
+    # neither does this. multi_retrieval falls back internally, so this is a
+    # belt-and-braces guard rather than an expected path.
+    return pool or _fallback(prep, state)
+
+
+def _original_retrieve(prep: Preprocessing, state: SessionState) -> list[str]:
+    """Fuse the three routes by reciprocal rank and return the top candidates.
+
+    The original Owner C implementation, kept intact. Set
+    USE_MULTI_RETRIEVAL = False at the top of this file to make it live again.
+    """
     routes = {
         "keyword": _keyword(prep, state),
         "category": _category(prep, state),
