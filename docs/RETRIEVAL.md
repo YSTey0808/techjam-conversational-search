@@ -451,6 +451,7 @@ bought.
 | Hard-then-soft constraint layering | +0.0003 |
 | Passing `Constraint.key` instead of `.text` | −0.007 |
 
-`keyword_mode="seeded"` and the vector route both remain in the code, off by
-default, with their measurements in their docstrings — so they can be re-tested
-in one flag if extraction changes.
+Seeded progressive intersection (`routes/seeded.py`, `keyword_mode="seeded"`)
+has since been removed from the code entirely; the measurement above is what's
+left of it. The vector route remains, off by default, with its measurements
+in its docstring, so it can be re-tested in one flag if extraction changes.

@@ -25,7 +25,6 @@ from .index import CatalogIndex
 from .routes.category import CategoryRoute
 from .routes.keyword import KeywordRoute
 from .routes.prior import DEFAULT_WEIGHT, PopularityPrior
-from .routes.seeded import SeededRoute
 from .types import (
     DEFAULT_TRACKS,
     Candidate,
@@ -65,7 +64,6 @@ class DualTrackRetriever:
         raw_catalog_path: str | Path | None = None,
         tracks: dict[str, TrackConfig] | None = None,
         fusion: str = "rrf",
-        keyword_mode: str = "bm25",   # "bm25" | "seeded"
         layered: bool = True,
         pool_limit: int = POOL_LIMIT,
         embedder=None,
@@ -82,9 +80,7 @@ class DualTrackRetriever:
         self.layered = layered
         self.pool_limit = pool_limit
 
-        self.keyword_mode = keyword_mode
-        self.keyword = (SeededRoute(self.index) if keyword_mode == "seeded"
-                        else KeywordRoute(self.index))
+        self.keyword = KeywordRoute(self.index)
         self.category = CategoryRoute(self.index)
         self.filter = HardFilter(self.index)
         self.prior = PopularityPrior(self.index, weight=prior_weight)
@@ -204,7 +200,6 @@ class DualTrackRetriever:
         detail = self.index.diagnostics()
         detail["vector_route"] = type(self.vector).__name__ if self.vector else None
         detail["fusion"] = self.fusion
-        detail["keyword_mode"] = self.keyword_mode
         detail["prior_weight"] = self.prior.weight
         detail["layered"] = self.layered
         return detail
