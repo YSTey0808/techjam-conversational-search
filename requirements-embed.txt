@@ -1,0 +1,6 @@
+# Dependencies for embedder/ -- local embedding with nomic-embed-text-v1.5.
+# Separate from requirements.txt: the normalisation pipeline needs none of this,
+# and torch is a ~2GB install.
+sentence-transformers>=5.0,<7
+torch>=2.9,<3
+einops>=0.8            # required by nomic-embed's remote code

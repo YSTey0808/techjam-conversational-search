@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 from dataset_normalisation.columns.audience import audience
-from dataset_normalisation.columns.budget import budget
+from dataset_normalisation.columns.price import parse_price
 from dataset_normalisation.columns.category import product_family
 from dataset_normalisation.columns.color import extract_colors
 from dataset_normalisation.columns.feature import extract_features
@@ -33,13 +33,13 @@ from dataset_normalisation.columns.material import extract_materials
 from dataset_normalisation.columns.region import region
 
 CATALOG = Path("data/catalog.jsonl")
-STATE = Path("data/.pipeline_batch")      # batch id, so `finish` can find it
-LABELS = Path("data/labels.jsonl")        # collected style/use_case cache
-OUTPUT = Path("data/catalog_normalised.jsonl")
+STATE = Path("data/normalised/.pipeline_batch")      # batch id, so `finish` can find it
+LABELS = Path("data/normalised/labels.jsonl")        # collected style/use_case cache
+OUTPUT = Path("data/normalised/catalog_normalised.jsonl")
 
 COLUMNS = [
     "parent_asin", "category", "audience", "brand", "material", "color",
-    "feature", "style", "use_case", "budget", "price", "region",
+    "feature", "style", "use_case", "price", "region",
 ]
 
 
@@ -59,7 +59,7 @@ def load_catalog(limit=None, path=CATALOG):
 def apply_rules(row, with_source=False):
     family, family_src = product_family(row)
     colors, color_src = extract_colors(row)
-    band, price = budget(row)
+    price = parse_price(row.get("price"))
     origin, origin_src = region(row)
     group, audience_src = audience(row)
 
@@ -73,7 +73,6 @@ def apply_rules(row, with_source=False):
         "feature": extract_features(row),
         "style": [],        # filled by stage 2
         "use_case": [],     # filled by stage 2
-        "budget": band,
         "price": price,
         "region": origin,
     }

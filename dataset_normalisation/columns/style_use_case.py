@@ -15,7 +15,7 @@ makes "not stated" the expected output and the schema sets no `minItems`.
 Colour and material are ~64% / ~25% empty; these should look similar. A
 near-100% fill rate means the model is inventing labels.
 
-Model: claude-haiku-4-5, the tier costed in CATALOG_NOTES.md. Swap MODEL for
+Model: claude-haiku-4-5. Swap MODEL for
 `claude-opus-5` if label quality matters more than the ~5x cost difference.
 
 Submitting, polling and collecting live in dataset_normalisation/pipeline.py -- that is the
@@ -125,7 +125,7 @@ def normalise_labels(data):
 def slim(row):
     """Trim a catalog row to the fields that carry style/occasion signal.
 
-    description[] is dropped: CATALOG_NOTES measured 314 tok/product with it
+    description[] is dropped: it measured 314 tok/product with it
     and 161 without, for signal that title + features already carry.
     """
     return {

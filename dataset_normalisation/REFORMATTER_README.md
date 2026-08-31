@@ -3,7 +3,7 @@
 Reshapes `data/catalog.jsonl` (50,000 Amazon Clothing, Shoes & Jewelry listings)
 into a normalised, faceted table.
 
-Nine columns are deterministic rules (~16s, stdlib only). Two — `style` and
+Eight columns are deterministic rules (~16s, stdlib only). Two — `style` and
 `use_case` — come from a single Anthropic Batch API call.
 
 ---
@@ -26,7 +26,7 @@ LLM stage and `to_dataframe()`.
 python3 -m dataset_normalisation.pipeline run --no-llm
 ```
 
-Produces all 9 rule columns. `style` and `use_case` stay `[]`.
+Produces all 8 rule columns. `style` and `use_case` stay `[]`.
 
 ### Full run, two stages
 
@@ -39,7 +39,7 @@ python3 -m dataset_normalisation.pipeline status     # check progress (--wait to
 python3 -m dataset_normalisation.pipeline finish     # collect labels + merge
 ```
 
-`start` caches the batch id in `data/.pipeline_batch`, so `finish` works from a
+`start` caches the batch id in `data/normalised/.pipeline_batch`, so `finish` works from a
 new shell days later.
 
 ### Full run, one blocking command
@@ -61,7 +61,7 @@ python3 -m dataset_normalisation.pipeline start --limit 200
 | flag | effect |
 |---|---|
 | `--limit N` | process only the first N rows |
-| `--out PATH` | output path (default `data/catalog_normalised.jsonl`) |
+| `--out PATH` | output path (default `data/normalised/catalog_normalised.jsonl`) |
 | `--no-llm` | skip the LLM stage; `style`/`use_case` stay empty |
 | `--with-source` | also emit `*_source` columns (see Output Schema) |
 | `--interval N` | poll interval in seconds for `run` / `status --wait` (default 60) |
@@ -73,22 +73,22 @@ is not representative (the first 3,000 rows are ~80% priced vs 21% overall), so
 use a pilot to sanity-check labels, not to measure fill rates.
 
 A `--limit` run will not overwrite the full table: if `--out` is left at the
-default it writes to `data/catalog_normalised.limit<N>.jsonl` instead.
+default it writes to `data/normalised/catalog_normalised.limit<N>.jsonl` instead.
 
 ### Files written
 
 | path | what | tracked? |
 |---|---|---|
-| `data/catalog_normalised.jsonl` | the output table | gitignored |
-| `data/labels.jsonl` | cached LLM labels | gitignored |
-| `data/.pipeline_batch` | batch id for `finish` | gitignored |
+| `data/normalised/catalog_normalised.jsonl` | the output table | gitignored |
+| `data/normalised/labels.jsonl` | cached LLM labels | gitignored |
+| `data/normalised/.pipeline_batch` | batch id for `finish` | gitignored |
 
-Re-runs read `data/labels.jsonl` and **submit only rows it does not already
+Re-runs read `data/normalised/labels.jsonl` and **submit only rows it does not already
 cover**. So a 200-row pilot followed by a full run labels the remaining 49,800
 and never re-submits the same `parent_asin`. That cache is also what makes the
 output reproducible — the rules are deterministic, the LLM is not.
 
-**Keep `data/labels.jsonl`.** It is the only artifact here that cannot be
+**Keep `data/normalised/labels.jsonl`.** It is the only artifact here that cannot be
 regenerated for free; with it, a full rebuild is ~16s.
 
 ### In Python
@@ -101,7 +101,7 @@ df = to_dataframe(run_rules(load_catalog()))     # needs pandas
 ### Degradation
 
 Without `anthropic` or `ANTHROPIC_API_KEY`, the pipeline warns, leaves
-`style`/`use_case` empty, and still produces all 9 rule columns. Any labels
+`style`/`use_case` empty, and still produces all 8 rule columns. Any labels
 already in the cache are still merged.
 
 ---
@@ -136,7 +136,7 @@ Notable `details` keys: `Department` (87%), `Color` (4.9%), `Material` (4.1%),
 
 ## 3. Output Schema
 
-`data/catalog_normalised.jsonl` — one JSON object per input row, same order.
+`data/normalised/catalog_normalised.jsonl` — one JSON object per input row, same order.
 Fill rates measured on the full 50,000.
 
 | column | type | fill | source |
@@ -151,7 +151,6 @@ Fill rates measured on the full 50,000.
 | `style` | `list[str]` (enum) | 43.8% | `title` + `features` (LLM) |
 | `color` | `list[str]` (enum) | 37.1% | `details.Color` + `title` |
 | `region` | `str` | 33.3% | `details` + `features` |
-| `budget` | `str` (enum) | 20.8% | `price` |
 | `price` | `float \| None` | 20.8% | `price`, parsed |
 
 ### Empty conventions
@@ -159,7 +158,7 @@ Fill rates measured on the full 50,000.
 | type | means "not stated" |
 |---|---|
 | `list[str]` | `[]` |
-| `budget`, `region` | `"unknown"` |
+| `region` | `"unknown"` |
 | `price` | `null` |
 
 **Empty is a correct answer, not a gap.** `color` is ~63% empty because most
@@ -196,7 +195,6 @@ harmless, not worth a migration.
   "feature": ["machine-washable", "stretch"],
   "style": ["casual"],
   "use_case": [],
-  "budget": "unknown",
   "price": null,
   "region": "imported"
 }
@@ -220,14 +218,6 @@ women · men · girls · boys · baby · kids · unisex
 ```
 `unisex` is both a real value and the fallback for audience-less products
 (luggage tags, shoe trees). `audience_source == "default"` distinguishes them.
-
-### `budget` — 5
-```
-budget    < $15        mid       $15-40      premium   $40-100
-luxury    >= $100      unknown   price is null
-```
-Thresholds are the measured price quartiles: p25 $15.59, median $22.99,
-p75 $38.12, p95 $129.95.
 
 ### `region` — semi-open
 ```
@@ -293,7 +283,7 @@ the attribute. The caps are properties of the source data, not the rules.
 
 | column | empty | why it caps there |
 |---|---|---|
-| `budget` / `price` | 79.2% | `price` is null on ~79% of rows. Absent, not hidden — no method recovers it. |
+| `price` | 79.2% | `price` is null on ~79% of rows. Absent, not hidden — no method recovers it. |
 | `region` | 66.7% | most listings never state origin |
 | `color` | 62.9% | `parent_asin` is a **variant group**: the title describes the group, `details.Color` names one child SKU. Neither has a single correct answer. |
 | `style` | 56.2% | most listings state no aesthetic |
@@ -349,7 +339,7 @@ dataset_normalisation/
   pipeline.py            entry point — orchestration only
   columns/
     audience.py          audience()
-    budget.py            budget()            -> (band, price)
+    price.py             parse_price()       -> float | None
     category.py          product_family()
     color.py             extract_colors()
     feature.py           extract_features()
